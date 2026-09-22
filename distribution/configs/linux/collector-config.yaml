@@ -1,0 +1,136 @@
+# Monitorable OpenTelemetry Collector — Linux base configuration.
+#
+# Always-on metrics pipeline:
+#   - host_metrics : load, disk, filesystem, network, paging, memory — these
+#                   are what the dashboard's memory/disk/swap/network/load
+#                   panels are built from (see backend internal/metrics/service.go).
+#   - monitorable : host metadata + uptime, CPU time (system.cpu.time), CPU
+#                   temperature & frequency.
+#
+# Docker container metrics are collected by the monitorable receiver, which probes
+# the Docker socket each collection cycle and emits container metrics only when
+# a usable socket is present. Collection cadence is controlled by the batch processor.
+
+receivers:
+  # Standard OTel host metrics. Scraper / metric selection below is matched to the
+  # exact metric names the backend queries; do not prune without checking
+  # internal/metrics/service.go.
+  host_metrics:
+    collection_interval: 60s
+    scrapers:
+      # NOTE: system.cpu.time is emitted by the custom `monitorable` receiver
+      # (reads /proc/stat directly), NOT by hostmetrics. The hostmetrics cpu scraper
+      # wedges permanently on LXC/hotplug hosts when the set of logical CPUs changes
+      # between scrapes (ucal ErrTimeStatNotFound), dropping ALL cpu metrics. See
+      # docs/cpu-metrics.md.
+      load: {}        # system.cpu.load_average.{1m,5m,15m}
+      disk: {}        # system.disk.* (I/O throughput / operations)
+      filesystem:     # system.filesystem.usage{state=...} for the root mount ("/")
+        # Keep ZFS roots (nodev/virtual-classified since collector v0.154) but drop
+        # the kernel pseudo-filesystems + tmpfs + container overlays — the sandboxed
+        # non-root collector can't statfs some of them (e.g. /run/credentials/*,
+        # /run/user/*) and they aren't real disks. Excluding by fs TYPE covers /run
+        # (tmpfs) AND /var/lib/docker (overlay) AND any other virtual mount in one
+        # rule. The backend only queries mountpoint="/".
+        include_virtual_filesystems: true
+        exclude_fs_types:
+          match_type: strict
+          fs_types: [autofs, binfmt_misc, bpf, cgroup, cgroup2, configfs, debugfs, devpts, devtmpfs, fuse.lxcfs, fusectl, hugetlbfs, mqueue, nsfs, overlay, proc, procfs, pstore, ramfs, securityfs, selinuxfs, squashfs, sysfs, tmpfs, tracefs]
+      network: {}     # system.network.{io,packets,errors}{direction=...}
+      paging: {}      # system.paging.usage{state=...} (swap)
+      memory:         # system.memory.usage{state=...}
+        metrics:
+          system.memory.utilization:
+            enabled: true
+          system.memory.limit:   # backend reads this for total memory
+            enabled: true
+
+  monitorable:
+    # The monitorable receiver collects host metadata + uptime, CPU temperature
+    # and frequency. Collection frequency is controlled by the batch processor.
+    collection_interval: 60s
+    capability_interval: 24h
+
+processors:
+  batch:
+    # The batch processor controls how often data is sent to the backend.
+    # timeout: maximum time between sends (effectively the collection interval)
+    # send_batch_size: triggers a send when this many data points are collected
+    send_batch_size: 3000
+    send_batch_max_size: 5000
+    timeout: 60s  # Send data every 60 seconds
+
+  resource:
+    attributes:
+      - key: service.name
+        value: "monitorable-agent"
+        action: upsert
+
+extensions:
+  # Persistent sending queue for otlp_http. Batches wait here, on disk, until the
+  # backend accepts them — across collector restarts and multi-hour outages.
+  # /var/lib/monitorable is the unit's only ReadWritePaths entry and is owned by
+  # the monitorable user; the subdirectory is created on first start.
+  # MONITORABLE_STATE_DIR overrides the path (CI uses a temp dir).
+  file_storage:
+    directory: ${env:MONITORABLE_STATE_DIR:-/var/lib/monitorable/queue}
+    create_directory: true
+    timeout: 10s
+    # At ~two bbolt writes per minute the fsync cost is nil, and it's what makes the
+    # queue survive power loss, not only process restarts.
+    fsync: true
+    compaction:
+      # Shrink the bbolt file after a long outage drains, and at start.
+      on_start: true
+      on_rebound: true
+      # A SIGKILL during compaction (the unit's TimeoutStopSec is 10s, the HTTP client
+      # timeout 30s) leaves a tempdb* copy in the directory; this removes it at the next start.
+      cleanup_on_start: true
+      directory: ${env:MONITORABLE_STATE_DIR:-/var/lib/monitorable/queue}
+
+exporters:
+  otlp_http:
+    endpoint: "${MONITORABLE_ENDPOINT}"
+    headers:
+      Authorization: "Bearer ${MONITORABLE_API_KEY}"
+    # Retry semantics — an answer that retrying can fix is retried until it succeeds; one
+    # that it cannot is dropped at once, so a single bad batch never wedges the queue:
+    #   - retryable answers (429/502/503/504, connection errors) are retried FOREVER
+    #     (max_elapsed_time: 0), backoff capped at 60 s → recovery latency ≤ 60 s;
+    #   - permanent answers (4xx, 500) are dropped immediately — the backend only
+    #     says 503 when retrying can help, so a bad batch cannot wedge a consumer.
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 0
+    # queue_size counts BATCHES (sizer: requests): 1440 = one day at one batch per
+    # minute. Stored as uncompressed protobuf, typically 50-100 KB each → typically
+    # well under 150 MB. A busy host (send_batch_size: 3000) can flush more than one
+    # batch a minute, so 1440 requests may be less than a day there.
+    # When full, the NEWEST batch is rejected (block_on_overflow: false) so a
+    # receiver never blocks on export.
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      sizer: requests
+      queue_size: 1440
+      block_on_overflow: false
+      storage: file_storage
+    compression: gzip
+
+service:
+  extensions: [file_storage]
+  # Internal self-telemetry is disabled: nothing in Monitorable scrapes the collector's
+  # own metrics, and the default Prometheus exporter binds 127.0.0.1:8888 — a fixed port
+  # that crash-loops the collector if it is already in use on the host. `level: none`
+  # gives the meter provider a noop, so no port is bound. Likewise there is no
+  # health_check extension (it bound 127.0.0.1:13133); liveness is `systemctl is-active`.
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    metrics:
+      receivers: [host_metrics, monitorable]
+      processors: [batch, resource]
+      exporters: [otlp_http]

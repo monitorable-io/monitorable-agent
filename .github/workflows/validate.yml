@@ -1,0 +1,88 @@
+name: validate
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod, cache: true }
+      - run: go build ./...
+      - run: go vet ./...
+      # -race: the receiver's metadata cache is written by the redetect goroutine and read
+      # by collectMetrics, and that pairing has a dedicated concurrency test.
+      - run: go test -race ./...
+      - name: gofmt
+        run: gofmt -l . | tee /dev/stderr | (! read)
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: deadcode
+        run: test -z "$(go run golang.org/x/tools/cmd/deadcode@latest -test ./...)"
+      - name: shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "shellcheck not found on runner" >&2
+            exit 1
+          fi
+          shellcheck distribution/install.sh scripts/publish-dist.sh
+      - name: Cross-compile smoke (linux amd64+arm64)
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/agent-amd64 ./cmd/monitorable-agent
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /tmp/agent-arm64 ./cmd/monitorable-agent
+      - name: Smoke test (shipped Linux config starts, stays up, binds no port)
+        run: |
+          go build -o /tmp/agent ./cmd/monitorable-agent
+          # Dummy creds so ${MONITORABLE_ENDPOINT}/${MONITORABLE_API_KEY} expand; otlp_http
+          # does not connect at startup, so an unreachable endpoint is non-fatal here.
+          export MONITORABLE_ENDPOINT="http://127.0.0.1:4318"
+          export MONITORABLE_API_KEY="dummy-ci-key"
+          # Persistent queue (file_storage) must not need /var/lib/monitorable on the runner.
+          export MONITORABLE_STATE_DIR="$RUNNER_TEMP/agent-queue"
+          /tmp/agent --config distribution/configs/linux/collector-config.yaml > /tmp/smoke.out 2>&1 &
+          PID=$!
+          sleep 8
+          if ! kill -0 "$PID" 2>/dev/null; then
+            echo "SMOKE FAIL: collector exited"; cat /tmp/smoke.out
+            wait "$PID" 2>/dev/null; exit 1
+          fi
+          echo "SMOKE_OK: collector still running after 8s"
+          # The whole point of this change: the collector must bind NO inbound TCP socket
+          # (no :8888 internal telemetry, no :13133 health_check).
+          # Requires `ss` (iproute2), present on ubuntu-latest runners. If it were ever
+          # absent, `ss 2>/dev/null | grep -q` degrades to "no listener" (safe: a false
+          # negative that can't wrongly fail the job, never a false positive).
+          if ss -ltnp 2>/dev/null | grep -q "pid=$PID"; then
+            echo "SMOKE FAIL: collector is listening on a TCP port:"
+            ss -ltnp 2>/dev/null | grep "pid=$PID"
+            kill "$PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "SMOKE_OK: no inbound TCP listener"
+          # The otlp_http sending queue must have opened its bbolt file under the state
+          # dir. A missing/unregistered file_storage exits at startup (caught above), but
+          # a queue that silently fell back to memory (no `storage:` binding) would not.
+          if [ ! -f "$MONITORABLE_STATE_DIR/exporter_otlp_http__metrics" ]; then
+            echo "SMOKE FAIL: no persistent queue file under $MONITORABLE_STATE_DIR"; cat /tmp/smoke.out
+            kill "$PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "SMOKE_OK: persistent queue file present: $MONITORABLE_STATE_DIR/exporter_otlp_http__metrics"
+          kill "$PID" 2>/dev/null || true
+      # Vulnerability scan over the full dependency graph (>1000 packages, incl. the
+      # aws-sdk/k8s trees that otelconftelemetry links in). Reachability-based, so it
+      # reports the ones actually callable from this binary.
+      - name: govulncheck
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-file: go.mod
+          repo-checkout: false

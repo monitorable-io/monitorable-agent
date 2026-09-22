@@ -1,0 +1,6 @@
+# Compiled binaries
+/monitorable-agent
+/monitorable-agent-*
+
+# Distribution builds
+distribution-build/

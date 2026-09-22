@@ -1,0 +1,136 @@
+[Unit]
+Description=Monitorable agent
+Documentation=https://docs.monitorable.io
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitorable
+Group=monitorable
+ExecStart=/opt/monitorable/monitorable-agent --config=/etc/monitorable/collector-config.yaml
+# API key and endpoint. Root-only file written by install.sh; systemd reads it before
+# dropping privileges, so the secret is never in a world-readable unit file.
+EnvironmentFile=/etc/monitorable/agent.env
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+# Security settings
+NoNewPrivileges=yes
+ProtectSystem=strict
+# ProtectHome=tmpfs (not =yes): both mask /home, /root, /run/user, but =tmpfs uses a
+# regular tmpfs that a later BindReadOnlyPaths= can override, whereas =yes uses an
+# "inaccessible" mount that has the HIGHEST mount-mode priority in systemd, so a bind for
+# the same path is dropped (drop_inaccessible/MountMode in src/core/namespace.c). We need
+# the /home bind below to win, so this must be =tmpfs. See the /home comment below.
+ProtectHome=tmpfs
+ReadWritePaths=/var/lib/monitorable
+PrivateTmp=yes
+# Deliberately =no, not the hardened default: PrivateDevices=yes masks /dev/sd* and
+# /dev/nvme*, and the SMART collector opens those nodes O_RDONLY for its ioctls (see the
+# SMART capability block below). Write access to them is removed by DevicePolicy=closed
+# in the hardening block instead, which is the narrower tool for the job.
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# SMART disk health: capabilities are substituted by install.sh based on detected drives
+# (NVMe → CAP_SYS_RAWIO CAP_SYS_ADMIN; SATA-only → CAP_SYS_RAWIO; none → empty).
+# NVMe SMART/Identify are admin ioctls (CAP_SYS_ADMIN) on the controller node /dev/nvmeX;
+# install.sh also drops a udev rule giving the disk group read access to that node so the
+# unprivileged collector can open it O_RDONLY — no CAP_DAC_OVERRIDE. CAP_SYS_RAWIO covers SATA
+# SG_IO; the disk group grants /dev/sd* and (via the udev rule) the NVMe controller node.
+# CapabilityBoundingSet mirrors AmbientCapabilities (same placeholder) to cap the max privilege
+# to exactly what's granted; an empty value (no-disk host) resets the bounding set to none —
+# safe, the non-root collector needs no capabilities for its /proc, /sys, D-Bus or docker access.
+AmbientCapabilities=__MONITORABLE_SMART_CAPS__
+CapabilityBoundingSet=__MONITORABLE_SMART_CAPS__
+SupplementaryGroups=__MONITORABLE_SMART_GROUPS__
+
+# --- Hardening (verified against this agent's actual syscall/AF surface) ---
+SystemCallFilter=@system-service
+# `ioctl` is a DIRECT member of @system-service (systemd-analyze syscall-filter), so
+# SMART's SG_IO and NVME_IOCTL_ADMIN_CMD pass; seccomp cannot filter ioctl request numbers
+# anyway. Recursive expansion also confirms every Go-runtime call the agent makes:
+# mmap/mprotect/madvise/brk, futex/futex_waitv, membarrier, rseq, clone/clone3,
+# sched_getaffinity/sched_getattr, epoll_create1/epoll_pwait, getrandom, openat/openat2,
+# statx/newfstatat/statfs/fstatfs/getdents64, fsync/fdatasync, socket/connect/sendto,
+# prctl, execve. `mount` is absent, as wanted.
+SystemCallErrorNumber=EPERM
+# Fail a blocked call instead of SIGSYS-killing the agent: on a metrics collector a
+# degraded collector beats a dead host. Flip to the default (kill) once the fleet is clean.
+SystemCallArchitectures=native
+# Pure-Go linux/amd64|arm64 binary (CGO_ENABLED=0); no 32-bit or x32 syscall entry is needed.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# AF_UNIX = Docker socket + D-Bus system bus; AF_INET/6 = OTLP export + the pure-Go
+# resolver; AF_NETLINK = net.Interfaces() in internal/collectors/network.go. Nothing else.
+RestrictNamespaces=yes
+# Go creates threads with clone() but never CLONE_NEW*; nothing in the agent unshares.
+RestrictRealtime=yes
+# Nothing requests SCHED_FIFO/SCHED_RR.
+RestrictSUIDSGID=yes
+# The only file the agent creates is the 0600 bbolt queue; it never sets suid/sgid bits.
+LockPersonality=yes
+# Go never calls personality(2) with a non-native domain.
+MemoryDenyWriteExecute=yes
+# CGO_ENABLED=0, no JIT, no plugin/dlopen: the agent never needs a W+X mapping.
+ProtectKernelLogs=yes
+# Nothing reads /dev/kmsg or calls syslog(2); also drops CAP_SYSLOG from the bounding set.
+RemoveIPC=yes
+# The agent creates no SysV/POSIX IPC objects.
+KeyringMode=private
+# No kernel-keyring use; keeps the session keyring out of the unit.
+UMask=0077
+# Queue directory 0750 -> 0700; the bbolt file is already 0600.
+LimitCORE=0
+# A core dump would write MONITORABLE_API_KEY (held in the exporter config) to disk.
+ProtectClock=yes
+# Blocks clock_settime/adjtimex and drops CAP_SYS_TIME/CAP_WAKE_ALARM. DO NOT SHIP THIS
+# WITHOUT THE TWO DIRECTIVES BELOW: ProtectClock implies `DeviceAllow=char-rtc r`, and
+# DevicePolicy=auto "allows access to all devices if no explicit DeviceAllow= is present"
+# (systemd.resource-control(5)) — so enabling it alone silently degrades the unit to a
+# closed device policy and SMART loses /dev/sd* and /dev/nvme*.
+DevicePolicy=closed
+# install.sh replaces the placeholder line below with one read-only `DeviceAllow=<class> r`
+# line per disk class it detected, or deletes it outright on a host with no physical disk
+# (ProtectClock's implied char-rtc entry then remains the only allowance):
+#   NVMe -> char-nvme  (/dev/nvme0, the controller char node the SMART reader opens)
+#   SATA -> block-sd   (/dev/sda, block major 8 "sd")
+# Only classes the agent is also granted the `disk` group for appear here: without that
+# group the open is refused by the file mode before the device cgroup is ever consulted,
+# so an allowance for a class the agent cannot open anyway would be inert.
+# Net effect: the `disk` supplementary group keeps the READ access SMART needs and loses
+# the WRITE access to /dev/sda and /dev/nvme0n1 (both brw-rw---- root:disk) that otherwise
+# makes any agent compromise a full host compromise — disclosure, not modification.
+DeviceAllow=__MONITORABLE_SMART_DEVICES__
+
+# Container (LXC/lxcfs) visibility. The sandboxing above gives this unit a private
+# mount namespace whose /proc lacks lxcfs's per-file overlays, so on an LXC guest the
+# collector would read the *host node's* /proc — reporting the host's RAM (e.g. 256 GB
+# vs the container's 8 GB), CPU count and load average rather than the container's
+# (both our hardware-spec collector and the hostmetrics scrapers read these straight
+# from /proc). Re-bind the container-manager view of the lxcfs-overlaid files — which
+# inside an LXC guest ARE the lxcfs overlays — back into this unit's namespace, keeping
+# all hardening. On bare-metal/KVM hosts there is no lxcfs, so each binds the file onto
+# itself — a verified no-op.
+BindReadOnlyPaths=/proc/meminfo
+BindReadOnlyPaths=/proc/cpuinfo
+BindReadOnlyPaths=/proc/stat
+BindReadOnlyPaths=/proc/loadavg
+
+# ProtectHome above masks a SEPARATE /home (and /root, /run/user) with tmpfs in this
+# unit's mount namespace, so statvfs("/home") would read the tmpfs (~3 GB) instead of the
+# real device — the per-mount Disk Usage tab then shows /home ~0% instead of its true
+# fill. Re-expose the real /home read-only OVER that tmpfs (a bind outranks tmpfs in
+# systemd's mount-mode priority); /root + /run/user keep their tmpfs mask. The `-` makes
+# it tolerant of hosts without /home. Same fix class as the lxcfs /proc binds above.
+# (This is why ProtectHome must be =tmpfs, not =yes — see the comment up there.)
+BindReadOnlyPaths=-/home
+
+[Install]
+WantedBy=multi-user.target

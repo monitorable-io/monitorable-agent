@@ -1,0 +1,151 @@
+name: release
+# Two publish surfaces, one script (scripts/publish-dist.sh <env>):
+#
+#   staging  — automatic on every `v*` tag push (job `release`): test gate, publish the
+#              versioned distribution + latest.json to the staging R2 bucket, GitHub release.
+#   prod     — MANUAL DISPATCH ONLY (job `publish-prod`), by design: dispatch this workflow
+#              on `main` with target=publish-prod, tag=<an already-released v* tag> and
+#              confirm=publish-prod. The job checks out THAT TAG's tree (binaries, install.sh,
+#              configs, unit), keeps this workflow's own scripts/publish-dist.sh as the
+#              publish tooling, re-runs the test gate and publishes to the prod bucket
+#              (get.monitorable.io). It refuses a tag without a GitHub release, i.e. one
+#              that never went through the staging path. Prod never publishes on a push,
+#              so a tag that turns out bad on staging never reaches customers; the typed
+#              confirm guards against a mis-click. A plain dispatch (target=prune-staging)
+#              only enforces R2 retention on staging, as before.
+#              (Dispatching ON the tag would not work: GitHub runs the workflow file as it
+#              exists at the dispatched ref, and older tags predate this job.)
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "prune-staging (retention only) or publish-prod (publish the selected TAG to get.monitorable.io)"
+        type: choice
+        required: true
+        default: prune-staging
+        options: [prune-staging, publish-prod]
+      tag:
+        description: "For publish-prod: the released v* tag to publish (e.g. v1.2.0)"
+        required: false
+        default: ""
+      confirm:
+        description: "For publish-prod: type publish-prod to confirm a PRODUCTION publish"
+        required: false
+        default: ""
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.event_name == 'push' || inputs.target == 'prune-staging'
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      CLOUDFLARE_R2_TOKEN: ${{ secrets.CLOUDFLARE_R2_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod, cache: true }
+      - name: Test gate
+        run: go build ./... && go vet ./... && go test -race ./...
+      - name: Preflight — prove the R2 credentials can write the staging bucket
+        # publish-dist.sh derives S3 credentials from CLOUDFLARE_R2_TOKEN (a bucket-scoped
+        # "Object Read & Write" token) and does one put + delete of a tiny object. Fails in
+        # seconds with a named cause instead of five retries per object later.
+        run: scripts/publish-dist.sh staging --preflight
+      - name: Publish versioned distribution to staging R2
+        if: github.event_name == 'push'
+        run: scripts/publish-dist.sh staging
+      - name: Enforce R2 retention only (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: scripts/publish-dist.sh staging --prune-only
+      - name: GitHub Release
+        if: github.event_name == 'push'
+        # The tag goes through the environment, not through ${{ }} interpolation into the
+        # shell: a git refname may contain $ ( ) " ` and ; , which would otherwise execute
+        # in a job that holds contents:write and the staging environment's R2 token.
+        run: gh release create "$TAG" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+
+  publish-prod:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'publish-prod'
+    runs-on: ubuntu-latest
+    # The `production` environment holds a SEPARATE R2 token ("Object Read & Write",
+    # scoped to bucket monitorable-get-prod only); the staging job's token cannot write
+    # get.monitorable.io and vice versa. Uploads go over the S3 API — see publish-dist.sh.
+    environment: production
+    timeout-minutes: 25
+    env:
+      CLOUDFLARE_R2_TOKEN: ${{ secrets.CLOUDFLARE_R2_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      VERSION: ${{ inputs.tag }}
+    steps:
+      - name: Refuse unless confirmed and the tag is well-formed
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$CONFIRM" != "publish-prod" ]; then
+            echo "::error::confirm input must be exactly 'publish-prod' (got '$CONFIRM')"
+            exit 1
+          fi
+          # VERSION (object paths + latest.json) comes straight from this input, so it
+          # must be a plain release tag: nothing else may reach `git checkout` below.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag input must look like vX.Y.Z (got '$TAG')"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check out the tag's tree, keep this ref's publish tooling
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            echo "::error::tag '$TAG' does not exist"; exit 1
+          fi
+          # Only tags that went through the staging release path have a GitHub release.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::tag '$TAG' has no GitHub release — it was never released to staging"; exit 1
+          fi
+          TOOLING_SHA="$(git rev-parse HEAD)"
+          git checkout -q "refs/tags/$TAG"
+          git checkout -q "$TOOLING_SHA" -- scripts/publish-dist.sh
+          echo "artifacts from tag $TAG = $(git rev-parse --short "refs/tags/$TAG"); publish-dist.sh from ${TOOLING_SHA:0:7}"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod, cache: true }
+      - name: Test gate
+        run: go build ./... && go vet ./... && go test -race ./...
+      - name: Preflight — prove the R2 credentials can write the prod bucket
+        # publish-dist.sh derives S3 credentials from CLOUDFLARE_R2_TOKEN (a bucket-scoped
+        # "Object Read & Write" token) and does one put + delete of a tiny object. Fails in
+        # seconds with a named cause instead of five retries per object later.
+        run: scripts/publish-dist.sh prod --preflight
+      - name: Publish versioned distribution to prod R2 (get.monitorable.io)
+        run: scripts/publish-dist.sh prod
+      - name: Record what was published
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          {
+            echo "published tag '$TAG' = $(git rev-parse --short "refs/tags/$TAG") to get.monitorable.io"
+            echo
+            echo '```'
+            cat distribution-build/binaries/otel/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

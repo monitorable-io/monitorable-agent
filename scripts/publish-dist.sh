@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Build Monitorable agent binaries, render install.sh for the target env, and publish
+# the full distribution (install.sh + configs + binaries) to that env's R2 bucket.
+#
+# Usage: scripts/publish-dist.sh <staging|prod> [--render-only|--prune-only|--preflight]
+#   --render-only : build + render into ./distribution-build, skip R2 upload
+#                   (CI dry-run / local test; no Cloudflare creds needed).
+#   --prune-only  : enforce R2 retention only (delete old versioned binaries), no build/publish
+#   --preflight   : prove the credentials can write this env's bucket (put + delete one
+#                   tiny object) and exit; no build. The release jobs run this first.
+#
+# Credentials (env): CLOUDFLARE_R2_TOKEN = an R2 API token with "Object Read & Write"
+# scoped to THIS env's bucket only, and CLOUDFLARE_ACCOUNT_ID. Uploads go over R2's S3
+# API with the AWS CLI; the S3 credentials are derived from the token as Cloudflare
+# documents (Access Key ID = the token's id, Secret Access Key = SHA-256 of its value),
+# so no second secret exists. Bucket-scoped tokens are exactly what the Cloudflare REST
+# API (wrangler) does NOT accept — it needs the account-wide "Admin Read & Write" — which
+# is why this script does not use wrangler (2026-09-22).
+set -euo pipefail
+
+ENV="${1:-}"
+MODE="${2:-}"
+VERSION="${VERSION:-dev}"
+
+# R2_JURISDICTION: the bucket's jurisdiction ("" = default, "eu"). A jurisdiction-
+# restricted bucket is reachable ONLY through its own S3 endpoint
+# (<account>.<jurisdiction>.r2.cloudflarestorage.com); on the default endpoint it does
+# not exist for the token — R2 answers AccessDenied, not NoSuchBucket (prod, 2026-09-22).
+# The dashboard's token page lists the endpoints its buckets need.
+case "$ENV" in
+  staging) BASE_URL="https://get-mon.ok9k.com"; BUCKET="monitorable-get-staging"; R2_JURISDICTION="${R2_JURISDICTION-}" ;;
+  prod)    BASE_URL="https://get.monitorable.io"; BUCKET="monitorable-get-prod";   R2_JURISDICTION="${R2_JURISDICTION-eu}" ;;
+  *) echo "usage: $0 <staging|prod> [--render-only|--prune-only|--preflight]" >&2; exit 1 ;;
+esac
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="$ROOT/distribution"
+OUT="$ROOT/distribution-build"
+BINOUT="$OUT/binaries/otel"
+
+# --- R2 access over the S3 API (AWS CLI, preinstalled on GitHub runners) ---
+S3_ENDPOINT=""
+r2_auth() {
+  local token="${CLOUDFLARE_R2_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}" verify id
+  if [ -z "$token" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+    echo "ERROR: CLOUDFLARE_R2_TOKEN and CLOUDFLARE_ACCOUNT_ID must be set" >&2; exit 1
+  fi
+  command -v aws >/dev/null || { echo "ERROR: aws CLI not found" >&2; exit 1; }
+  # The token id doubles as the S3 Access Key ID; verify answers it (user-owned tokens on
+  # /user/tokens/verify, account-owned ones on /accounts/<id>/tokens/verify) and doubles
+  # as the "is this a valid token at all" check. Prints status + id tail only.
+  for verify in "user/tokens/verify" "accounts/${CLOUDFLARE_ACCOUNT_ID}/tokens/verify"; do
+    id=$(curl -fsS -H "Authorization: Bearer $token" "https://api.cloudflare.com/client/v4/$verify" 2>/dev/null \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("result") or {}; print(r["id"] if d.get("success") and r.get("status")=="active" else "")' 2>/dev/null || true)
+    [ -n "$id" ] && break
+  done
+  if [ -z "$id" ]; then
+    echo "ERROR: Cloudflare does not accept CLOUDFLARE_R2_TOKEN as an active API token (length ${#token})." >&2
+    echo "       Re-create it under R2 → Manage R2 API Tokens and store its 'Token value'." >&2
+    exit 1
+  fi
+  echo "r2: token active (id …${id: -6}), account …${CLOUDFLARE_ACCOUNT_ID: -4}, bucket ${BUCKET}"
+  export AWS_ACCESS_KEY_ID="$id"
+  AWS_SECRET_ACCESS_KEY="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
+  export AWS_SECRET_ACCESS_KEY
+  export AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true
+  # Newer AWS CLIs add CRC checksum trailers by default; keep to what R2 accepts.
+  export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+  S3_ENDPOINT="https://${CLOUDFLARE_ACCOUNT_ID}${R2_JURISDICTION:+.$R2_JURISDICTION}.r2.cloudflarestorage.com"
+  echo "r2: endpoint …${S3_ENDPOINT#https://????????????????????????????????}"
+}
+s3() { aws --endpoint-url "$S3_ENDPOINT" "$@"; }
+# Delete is idempotent on S3 (a missing key still returns 204), so a failure here is a
+# real one (auth, network), never "already gone".
+r2_delete() { s3 s3api delete-object --bucket "$BUCKET" --key "$1" >/dev/null; }
+
+if [ "$MODE" = "--preflight" ]; then
+  r2_auth
+  printf 'preflight %s %s\n' "$ENV" "$(date -u +%FT%TZ)" > "${TMPDIR:-/tmp}/r2-preflight.txt"
+  if ! s3 s3 cp "${TMPDIR:-/tmp}/r2-preflight.txt" "s3://${BUCKET}/.preflight" --content-type text/plain --no-progress; then
+    echo "ERROR: token is active but cannot write bucket ${BUCKET}: check its permission (Object Read & Write) and bucket scope, on the account that owns the bucket" >&2
+    exit 1
+  fi
+  r2_delete ".preflight" || echo "note: could not delete ${BUCKET}/.preflight (harmless)"
+  echo "preflight OK: credentials can write ${BUCKET}"; exit 0
+fi
+
+# --- Retention: keep latest/ + the N newest vX.Y.Z versions on R2 (best-effort) ---
+# Version source is git tags, so the release checkout must fetch them (fetch-depth: 0).
+KEEP_VERSIONS="${KEEP_VERSIONS:-5}"
+prune_old_r2_versions() {
+  local tags old v arch key
+  r2_auth
+  tags=$(git -C "$ROOT" tag -l 'v[0-9]*' 2>/dev/null | sort -V) || { echo "retention: git tags unavailable, skipping prune"; return 0; }
+  [ -z "$tags" ] && { echo "retention: no version tags, nothing to prune"; return 0; }
+  old=$(printf '%s\n' "$tags" | head -n "-${KEEP_VERSIONS}")
+  if [ -z "$old" ]; then
+    echo "retention: $(printf '%s\n' "$tags" | grep -c .) version(s) <= keep=${KEEP_VERSIONS}; nothing to prune"; return 0
+  fi
+  # shellcheck disable=SC2086  # intentional word-split: one version per word on one line
+  echo "retention: keeping latest/ + newest ${KEEP_VERSIONS}; pruning binaries for:" $old
+  for v in $old; do
+    for arch in amd64 arm64; do
+      # Old name too, so v1.1.x objects published under the pre-rename binary name are still reaped.
+      for key in "binaries/otel/$v/monitorable-agent-linux-$arch" "binaries/otel/$v/monitorable-otelcol-linux-$arch"; do
+        if r2_delete "$key"; then echo "  pruned $key (or already absent)"; else echo "  (delete FAILED for $key)"; fi
+      done
+    done
+    if r2_delete "binaries/otel/$v/SHA256SUMS"; then echo "  pruned binaries/otel/$v/SHA256SUMS (or already absent)"; else echo "  (delete FAILED for $v/SHA256SUMS)"; fi
+  done
+}
+
+# --prune-only: skip build/publish, just enforce retention on R2 (manual / backlog cleanup)
+if [ "$MODE" = "--prune-only" ]; then
+  prune_old_r2_versions || echo "retention prune skipped (non-fatal)"
+  echo "prune-only complete"; exit 0
+fi
+
+rm -rf "$OUT"
+mkdir -p "$OUT/configs" "$BINOUT"
+
+# 1. Render install.sh (bake BASE_URL)
+sed "s|@@BASE_URL@@|$BASE_URL|g" "$SRC/install.sh" > "$OUT/install.sh"
+chmod +x "$OUT/install.sh"
+if grep -q '@@BASE_URL@@' "$OUT/install.sh"; then
+  echo "ERROR: unrendered @@BASE_URL@@ remains in install.sh" >&2; exit 1
+fi
+
+# 2. Stage the configs to publish. Published surface is Linux-only.
+mkdir -p "$OUT/configs/linux"
+cp -R "$SRC/configs/linux/." "$OUT/configs/linux/"
+
+# 3. Cross-compile binaries (CGO off for static, portable artifacts). Linux only.
+build() { # os arch ext
+  local os="$1" arch="$2" ext="${3:-}"
+  echo "building ${os}/${arch}"
+  GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+    go build -C "$ROOT" \
+    -ldflags "-X github.com/monitorable-io/monitorable-agent/internal/version.Version=${VERSION}" \
+    -o "$BINOUT/monitorable-agent-${os}-${arch}${ext}" \
+    cmd/monitorable-agent/main.go
+}
+build linux amd64
+build linux arm64
+# macOS/Windows intentionally not built/published yet (owner decision 2026-06-14);
+# to enable later, add `build darwin …` / `build windows … .exe` + their config copy.
+
+# 3b. Checksums for the installer's verification step. ONE SHA256SUMS covers every file
+# install.sh downloads — both binaries, the collector config and the systemd unit template
+# — because the unit template is sed-rendered into /etc/systemd/system and daemon-reloaded,
+# i.e. an unverified one is an arbitrary ExecStart on every installing host.
+# The two config files are copied into $BINOUT purely so the four entries can be generated
+# (and verified locally with `cd distribution-build/binaries/otel && sha256sum -c
+# SHA256SUMS`) under BARE relative names, which is how install.sh looks them up. They are
+# PUBLISHED from $OUT/configs below; the upload loop here globs monitorable-agent-linux-*
+# only, so these copies never reach the bucket.
+cp "$OUT/configs/linux/collector-config.yaml" "$OUT/configs/linux/monitorable-agent.service" "$BINOUT/"
+( cd "$BINOUT" && sha256sum \
+    monitorable-agent-linux-amd64 \
+    monitorable-agent-linux-arm64 \
+    collector-config.yaml \
+    monitorable-agent.service > SHA256SUMS )
+
+if [ "$MODE" = "--render-only" ]; then
+  echo "render-only: artifacts in $OUT"; exit 0
+fi
+
+# 4. Publish to the REAL bucket.
+r2_auth
+# Each put is retried: a transient Cloudflare error on ONE object (seen on the v1.2.0
+# release, on the last object) would otherwise abort the run and leave a partial surface
+# — new binaries under a stale SHA256SUMS, or vice versa — until someone re-runs the job.
+# Overwriting an R2 object is idempotent, so a retry after a half-applied put is safe.
+PUT_ATTEMPTS="${PUT_ATTEMPTS:-5}"
+put() { # localpath key content-type
+  local attempt=1
+  while :; do
+    if s3 s3 cp "$1" "s3://${BUCKET}/$2" --content-type "$3" --no-progress; then
+      return 0
+    fi
+    if [ "$attempt" -ge "$PUT_ATTEMPTS" ]; then
+      echo "ERROR: put $2 failed after $attempt attempt(s)" >&2
+      return 1
+    fi
+    echo "put $2: attempt $attempt failed; retrying in $((attempt * 5))s" >&2
+    sleep "$((attempt * 5))"
+    attempt=$((attempt + 1))
+  done
+}
+put "$OUT/install.sh" "install.sh" "text/x-shellscript"
+
+# Publish order is binaries → configs → SHA256SUMS, and SHA256SUMS is strictly last.
+# install.sh verifies the binary, the config AND the unit against that one object, so any
+# install that races this publish FAILS CLOSED — a new config or binary against the old
+# sums (or the reverse) aborts before anything is touched, and the operator retries. The
+# window is the length of this upload, a few minutes. Sums last keeps that window as short
+# as possible and keeps the previous set installable for as much of it as possible; it
+# does not eliminate it. Signed, versioned config objects would; see distribution/README.md.
+# (Fail loud if the build produced no binaries, rather than uploading a literal glob.)
+shopt -s nullglob
+bins=("$BINOUT"/monitorable-agent-linux-*)
+shopt -u nullglob
+if [ "${#bins[@]}" -eq 0 ]; then
+  echo "ERROR: no binaries in $BINOUT — build step produced nothing" >&2; exit 1
+fi
+for f in "${bins[@]}"; do
+  put "$f" "binaries/otel/${VERSION}/$(basename "$f")" "application/octet-stream"
+  put "$f" "binaries/otel/latest/$(basename "$f")"     "application/octet-stream"
+done
+
+# Configs are unversioned objects while binaries are versioned, so upload configs
+# AFTER binaries: a reinstall that races this publish then sees, at worst, an old
+# config with a new binary (harmless) rather than a new config with an old binary
+# (unknown `file_storage` type to that binary → crash loop).
+while IFS= read -r f; do
+  rel="configs/${f#"$OUT"/configs/}"
+  case "$f" in
+    *.yaml) ct="text/yaml" ;;
+    *)      ct="text/plain" ;;   # .service
+  esac
+  put "$f" "$rel" "$ct"
+done < <(find "$OUT/configs" -type f)
+
+put "$BINOUT/SHA256SUMS" "binaries/otel/${VERSION}/SHA256SUMS" "text/plain"
+put "$BINOUT/SHA256SUMS" "binaries/otel/latest/SHA256SUMS"     "text/plain"
+
+# 4b. Version manifest — the backend reads this (GET /latest.json) to compare
+# each server's reported agent version against the newest published one.
+if [ "$VERSION" = "dev" ]; then
+  echo "WARN: VERSION=dev — skipping latest.json (publish from a v* tag to update it)"
+else
+  printf '{"version":"%s"}\n' "$VERSION" > "$OUT/latest.json"
+  put "$OUT/latest.json" "latest.json" "application/json"
+fi
+
+echo "published ${ENV} distribution to ${BUCKET}"
+
+# 4c. Verify the SERVED surface against what was just built: every object install.sh
+# downloads (versioned + latest/ binaries, configs, both SHA256SUMS), plus install.sh and
+# latest.json, fetched through the public base URL and compared byte-for-byte. A put
+# that "succeeded" but served something else, or a stale edge cache, fails the job here
+# rather than on a customer's host. Objects can take a moment to propagate, so mismatches
+# are retried for a bounded window before they count.
+verify_published() {
+  local vdir="$OUT/verify" key local_path tries
+  rm -rf "$vdir"; mkdir -p "$vdir"
+  # key → local file it must match
+  local pairs=(
+    "install.sh=$OUT/install.sh"
+    "binaries/otel/${VERSION}/SHA256SUMS=$BINOUT/SHA256SUMS"
+    "binaries/otel/latest/SHA256SUMS=$BINOUT/SHA256SUMS"
+    "configs/linux/collector-config.yaml=$OUT/configs/linux/collector-config.yaml"
+    "configs/linux/monitorable-agent.service=$OUT/configs/linux/monitorable-agent.service"
+  )
+  local f
+  for f in "${bins[@]}"; do
+    pairs+=("binaries/otel/${VERSION}/$(basename "$f")=$f" "binaries/otel/latest/$(basename "$f")=$f")
+  done
+  if [ "$VERSION" != "dev" ]; then
+    pairs+=("latest.json=$OUT/latest.json")
+  fi
+  local pair
+  for pair in "${pairs[@]}"; do
+    key="${pair%%=*}"; local_path="${pair#*=}"
+    tries=0
+    until curl -fsSL --retry 3 -o "$vdir/obj" "$BASE_URL/$key" && cmp -s "$vdir/obj" "$local_path"; do
+      tries=$((tries + 1))
+      if [ "$tries" -ge 12 ]; then
+        echo "ERROR: served $BASE_URL/$key does not match the published $local_path (after ${tries} tries)" >&2
+        return 1
+      fi
+      sleep 10
+    done
+    echo "verified $key"
+  done
+  rm -rf "$vdir"
+}
+verify_published
+echo "verified ${ENV} surface at ${BASE_URL}"
+
+# 5. Enforce retention: keep latest/ + the newest KEEP_VERSIONS versions on R2.
+prune_old_r2_versions || echo "retention prune skipped (non-fatal)"
