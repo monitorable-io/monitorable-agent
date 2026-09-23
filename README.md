@@ -56,7 +56,8 @@ the tool's previous name (`monitorable-otelcol` / `monitorable-collector`).
 - Runs as a dedicated, unprivileged `monitorable` user — never root
 - The systemd unit is sandboxed: `ProtectSystem=strict`, `NoNewPrivileges`, a private
   mount namespace, a `@system-service` syscall filter, `MemoryDenyWriteExecute`,
-  `UMask=0077`, and `DevicePolicy=closed` with a read-only allow-list for exactly the disk
+  `UMask=0077`, `NoExecPaths=/` with only the agent binary re-allowed (it execs nothing),
+  and `DevicePolicy=closed` with a read-only allow-list for exactly the disk
   nodes SMART needs — so the `disk` group grants the agent no write access to raw devices
 - SMART disk health is least-privilege and tiered by what's detected: no physical disk
   grants nothing; SATA/SAS grants `CAP_SYS_RAWIO`; NVMe additionally grants

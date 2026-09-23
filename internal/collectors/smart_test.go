@@ -223,10 +223,59 @@ func TestCollect_AllPermissionDeniedYieldsNoPermission(t *testing.T) {
 	}
 }
 
-// A mix of permission and non-permission errors (e.g. a genuinely SMART-less virtio
-// device alongside a permission-denied one) is not a clean "all denied" signal, so it
-// stays SmartAbsent rather than claiming a permission wall.
+// A mix of permission and non-permission errors WITHIN the SMART-capable classes (a
+// SATA disk that simply exposes no SMART alongside a permission-denied one) is not a
+// clean "all denied" signal, so it stays SmartAbsent rather than claiming a permission
+// wall. (A virtio device's outcome never enters the verdict; see the virtio tests.)
 func TestCollect_MixedErrorsYieldAbsent(t *testing.T) {
+	fr := &fakeReader{
+		devices: []string{"sda", "sdb"},
+		errs: map[string]error{
+			"sda": &fs.PathError{Op: "open", Path: "/dev/sda", Err: syscall.EACCES},
+			"sdb": errors.New("no SMART (USB bridge)"),
+		},
+	}
+	res := (&SmartCollector{reader: fr}).Collect(context.Background())
+	if res.Status != SmartAbsent {
+		t.Fatalf("status = %v, want SmartAbsent (mixed failure reasons)", res.Status)
+	}
+}
+
+// TestCollect_PermissionDeniedOnVirtioIsAbsent pins the class rule: a host whose only
+// disk is virtio gets no SMART capabilities, disk group or DeviceAllow= from install.sh,
+// so the sandboxed unit's open of /dev/vda is refused. That refusal is not a
+// misconfiguration to surface as SmartNoPermission (nothing could be read there anyway)
+// — the host simply has no SMART-capable disk.
+func TestCollect_PermissionDeniedOnVirtioIsAbsent(t *testing.T) {
+	fr := &fakeReader{
+		devices: []string{"vda"},
+		errs:    map[string]error{"vda": &fs.PathError{Op: "open", Path: "/dev/vda", Err: syscall.EPERM}},
+	}
+	res := (&SmartCollector{reader: fr}).Collect(context.Background())
+	if res.Status != SmartAbsent {
+		t.Fatalf("status = %v, want SmartAbsent (virtio denial carries no SMART signal)", res.Status)
+	}
+}
+
+// A denied SATA disk next to a denied virtio one is still a permission wall: the
+// SATA class is one install.sh should have granted.
+func TestCollect_PermissionDeniedOnSATAWithVirtioIsNoPermission(t *testing.T) {
+	fr := &fakeReader{
+		devices: []string{"vda", "sda"},
+		errs: map[string]error{
+			"vda": &fs.PathError{Op: "open", Path: "/dev/vda", Err: syscall.EPERM},
+			"sda": &fs.PathError{Op: "open", Path: "/dev/sda", Err: syscall.EACCES},
+		},
+	}
+	res := (&SmartCollector{reader: fr}).Collect(context.Background())
+	if res.Status != SmartNoPermission {
+		t.Fatalf("status = %v, want SmartNoPermission (sda is a SMART-capable class)", res.Status)
+	}
+}
+
+// A denied SATA disk next to a SMART-less virtio disk IS a permission wall: the virtio
+// device is outside the verdict, and the one capable device was refused.
+func TestCollect_DeniedSATABesideVirtioIsNoPermission(t *testing.T) {
 	fr := &fakeReader{
 		devices: []string{"sda", "vdb"},
 		errs: map[string]error{
@@ -235,7 +284,7 @@ func TestCollect_MixedErrorsYieldAbsent(t *testing.T) {
 		},
 	}
 	res := (&SmartCollector{reader: fr}).Collect(context.Background())
-	if res.Status != SmartAbsent {
-		t.Fatalf("status = %v, want SmartAbsent (mixed failure reasons)", res.Status)
+	if res.Status != SmartNoPermission {
+		t.Fatalf("status = %v, want SmartNoPermission", res.Status)
 	}
 }
