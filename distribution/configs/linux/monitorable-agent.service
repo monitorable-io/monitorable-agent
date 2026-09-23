@@ -1,6 +1,6 @@
 [Unit]
 Description=Monitorable agent
-Documentation=https://docs.monitorable.io
+Documentation=https://monitorable.io/docs/collector/install/
 After=network-online.target
 Wants=network-online.target
 
@@ -89,6 +89,12 @@ UMask=0077
 # Queue directory 0750 -> 0700; the bbolt file is already 0600.
 LimitCORE=0
 # A core dump would write MONITORABLE_API_KEY (held in the exporter config) to disk.
+NoExecPaths=/
+ExecPaths=/opt/monitorable/monitorable-agent
+# The agent is a single static binary that execs nothing: metrics come from /proc, /sys,
+# SMART ioctls, the Docker socket and D-Bus, never from a child process (the pre-v1.2
+# run.sh launcher is gone). Mount everything noexec and re-allow only the binary systemd
+# starts, so a compromised agent cannot run anything else on the host.
 ProtectClock=yes
 # Blocks clock_settime/adjtimex and drops CAP_SYS_TIME/CAP_WAKE_ALARM. DO NOT SHIP THIS
 # WITHOUT THE TWO DIRECTIVES BELOW: ProtectClock implies `DeviceAllow=char-rtc r`, and

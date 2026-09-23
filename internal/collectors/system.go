@@ -96,6 +96,11 @@ func parseOSRelease(data []byte) string {
 			return version
 		}
 	}
+	// A scan error (a line over bufio's 64 KiB token limit) ends the loop early;
+	// the fallback is the same either way, but don't pretend the file was read.
+	if err := scanner.Err(); err != nil {
+		return "unknown"
+	}
 
 	return "unknown"
 }
@@ -220,6 +225,11 @@ func (c *HardwareSpecCollector) parseCPUInfo(spec *HardwareSpec) {
 		}
 	}
 
+	// A scan error (an over-long line) ends the loop early; whatever was parsed
+	// before it stands, and the fallbacks below fill the rest as for a short file.
+	if err := scanner.Err(); err != nil && processorCount == 0 {
+		processorCount = runtime.NumCPU()
+	}
 	spec.CPUThreadsTotal = processorCount
 
 	// If we couldn't determine cores from cpuinfo, estimate from logical processors
@@ -254,6 +264,9 @@ func (c *HardwareSpecCollector) getTotalRAM() int64 {
 			break
 		}
 	}
+	// Reached only without a MemTotal line: either the file lacks one or the scan
+	// stopped on an error; both mean "unknown", which 0 already encodes.
+	_ = scanner.Err()
 
 	return 0
 }
@@ -280,6 +293,12 @@ func (c *HardwareSpecCollector) getCurrentCPUFreq() int64 {
 				}
 			}
 		}
+	}
+
+	// A scan error before any "cpu MHz" line means /proc/cpuinfo could not be
+	// read through; fall back to sysfs exactly as when the file failed to open.
+	if err := scanner.Err(); err != nil && len(frequencies) == 0 {
+		return c.getCPUFreqFromSys()
 	}
 
 	// Calculate average frequency

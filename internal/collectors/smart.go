@@ -25,9 +25,20 @@ type SmartStatus int
 
 const (
 	SmartAbsent       SmartStatus = iota // no readable physical disk
-	SmartNoPermission                    // device present but read denied
+	SmartNoPermission                    // a SATA/NVMe device is present but read denied
 	SmartPresent                         // snapshot collected (possibly empty)
 )
+
+// isSmartCapableDevice reports whether a block device name belongs to a class the
+// reader can actually pull SMART from (SATA/SAS `sd*`, NVMe `nvme*`). install.sh grants
+// the unit's capabilities, disk group and DeviceAllow= only for those classes; on a
+// host with just a virtio `vd*` disk it grants nothing, so under DevicePolicy=closed the
+// open fails with EPERM/EACCES exactly as it would for a real misconfiguration. That
+// denial carries no SMART signal (virtio exposes none), so it must count as "unsupported",
+// not as a permission wall the operator should fix by reinstalling.
+func isSmartCapableDevice(name string) bool {
+	return strings.HasPrefix(name, "sd") || strings.HasPrefix(name, "nvme")
+}
 
 // DiskSnapshot is one physical drive's current SMART state. nil pointers mean "unavailable".
 type DiskSnapshot struct {
@@ -240,15 +251,20 @@ func (c *SmartCollector) Collect(ctx context.Context) SmartResult {
 		return SmartResult{Status: SmartNoPermission}
 	}
 	out := make([]DiskSnapshot, 0, len(devices))
+	// The permission verdict is taken over SMART-capable classes only: a denied
+	// virtio disk (see isSmartCapableDevice) neither proves nor disproves anything.
 	attempted, permDenied := 0, 0
 	for _, dev := range devices {
 		if ctx.Err() != nil {
 			break
 		}
-		attempted++
+		capable := isSmartCapableDevice(dev)
+		if capable {
+			attempted++
+		}
 		raw, rerr := c.readWithDeadline(ctx, dev)
 		if rerr != nil {
-			if isPermissionErr(rerr) {
+			if capable && isPermissionErr(rerr) {
 				permDenied++
 			}
 			continue // unreadable/virtio/timeout → skip silently
