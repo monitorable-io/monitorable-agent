@@ -15,6 +15,8 @@
 # The fallback puts the key in the world-readable /proc/<pid>/cmdline for the whole run
 # and in sudo's auth.log — prefer the root-shell form wherever you can.
 # Optional: --endpoint=https://ingest.monitorable.net (default), --version=vX.Y.Z
+# Update (key and endpoint from /etc/monitorable/agent.env): curl -fsSL @@BASE_URL@@/install.sh | sudo sh
+# Uninstall: curl -fsSL @@BASE_URL@@/install.sh | sudo sh -s -- --uninstall
 
 set -e
 
@@ -36,8 +38,14 @@ fi
 
 # Default values
 # Defaults to the dedicated production ingest surface (the .net zone); the backend always
-# passes --endpoint=, so this default only applies to a hand-run install.
-ENDPOINT="${MONITORABLE_ENDPOINT:-https://ingest.monitorable.net}"
+# passes --endpoint=, so this default only applies to a hand-run install. It applies only
+# when neither a flag, the environment, nor an existing agent.env (a key-free re-run) gives
+# an endpoint.
+DEFAULT_ENDPOINT="https://ingest.monitorable.net"
+# Empty unless set explicitly (env here, a flag below); a key-free re-run then takes the
+# endpoint from agent.env before falling back to DEFAULT_ENDPOINT.
+ENDPOINT="${MONITORABLE_ENDPOINT:-}"
+AGENT_ENV="/etc/monitorable/agent.env"
 # Prefer the key from the environment: an argv value sits in the world-readable
 # /proc/<pid>/cmdline for the whole run and sudo writes it permanently to auth.log.
 # --api-key= still works and overrides, for the command the dashboard renders today.
@@ -52,6 +60,8 @@ VERSION="latest"
 # the rest of this script and every child process.
 SVC_USER="monitorable"
 SVC_GROUP="monitorable"
+UNINSTALL=0
+OTHER_OPTS=0
 
 printf '%b' "${BLUE}🚀 Monitorable agent installer${NC}\n"
 printf '%b' "${BLUE}================================${NC}\n"
@@ -61,14 +71,21 @@ while [ $# -gt 0 ]; do
     case $1 in
         --endpoint=*)
             ENDPOINT="${1#*=}"
+            OTHER_OPTS=1
             shift
             ;;
         --api-key=*)
             API_KEY="${1#*=}"
+            OTHER_OPTS=1
             shift
             ;;
         --version=*)
             VERSION="${1#*=}"
+            OTHER_OPTS=1
+            shift
+            ;;
+        --uninstall)
+            UNINSTALL=1
             shift
             ;;
         *)
@@ -81,18 +98,131 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Validate required parameters
-if [ -z "$ENDPOINT" ] || [ -z "$API_KEY" ]; then
-    printf '%b' "${RED}Error: Missing required parameters${NC}\n"
-    printf '%b' "Usage: run 'sudo -s' to get a root shell, then export\n"
-    printf '%b' "       MONITORABLE_API_KEY=<api-key> and pipe this script to\n"
-    printf '%b' "       'sh -s -- [--endpoint=<endpoint>]' (not sudo's -E flag: sudo-rs\n"
-    printf '%b' "       doesn't implement -E)\n"
-    printf '%b' "   or: "
-    printf '%s' "$0"
-    printf '%b' " --api-key=<api-key> [--endpoint=<endpoint>]  (key lands on argv)\n"
-    printf '%b' "Default endpoint: https://ingest.monitorable.net\n"
+if [ "$UNINSTALL" -eq 1 ] && [ "$OTHER_OPTS" -eq 1 ]; then
+    printf '%b' "${RED}--uninstall takes no other options${NC}\n"
     exit 1
+fi
+
+# Check if running as root
+if [ "$(id -u)" -ne 0 ]; then
+   printf '%b' "${RED}This script must be run as root (use sudo)${NC}\n"
+   exit 1
+fi
+
+if [ "$UNINSTALL" -eq 1 ]; then
+    printf '%b' "${YELLOW}🧹 Uninstalling the Monitorable agent...${NC}\n"
+    ACTED=0
+    FAILED=0
+    done_step() { printf '%b' "${GREEN}✓${NC} $1\n"; ACTED=1; }
+    skip_step() { printf '%b' "· $1: not present\n"; }
+
+    # monitorable-collector = the pre-rename unit (<= v1.1.x). disable --now runs
+    # unconditionally for both names (harmless no-op on an unknown unit) so a unit whose
+    # file was hand-deleted while it still runs gets stopped too; the file test below only
+    # decides whether there's a file left to remove and which line to print.
+    for unit in monitorable-agent monitorable-collector; do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        if [ -f "/etc/systemd/system/$unit.service" ]; then
+            if rm -f "/etc/systemd/system/$unit.service"; then
+                done_step "Stopped and removed the $unit service"
+            else
+                printf '%b' "${YELLOW}⚠️  Could not remove the $unit service file${NC}\n"
+                FAILED=1
+            fi
+        else
+            skip_step "$unit service"
+        fi
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed monitorable-agent monitorable-collector >/dev/null 2>&1 || true
+
+    # Binary, configuration (incl. the API key), state (incl. the unsent queue), logs.
+    for dir in /opt/monitorable /etc/monitorable /var/lib/monitorable /var/log/monitorable; do
+        if [ -e "$dir" ]; then
+            if rm -rf "$dir"; then
+                done_step "Deleted $dir"
+            else
+                printf '%b' "${YELLOW}⚠️  Could not delete $dir${NC}\n"
+                FAILED=1
+            fi
+        else
+            skip_step "$dir"
+        fi
+    done
+
+    UDEV_RULE=/etc/udev/rules.d/99-monitorable-nvme-smart.rules
+    if [ -f "$UDEV_RULE" ]; then
+        if rm -f "$UDEV_RULE"; then
+            if command -v udevadm >/dev/null 2>&1; then
+                udevadm control --reload-rules >/dev/null 2>&1 || true
+            fi
+            done_step "Removed the NVMe SMART udev rule"
+        else
+            printf '%b' "${YELLOW}⚠️  Could not remove the NVMe SMART udev rule${NC}\n"
+            FAILED=1
+        fi
+    else
+        skip_step "NVMe SMART udev rule"
+    fi
+
+    if getent passwd "$SVC_USER" >/dev/null 2>&1; then
+        if userdel "$SVC_USER" >/dev/null 2>&1; then
+            done_step "Deleted the $SVC_USER user"
+        else
+            printf '%b' "${YELLOW}⚠️  Could not delete the $SVC_USER user (is a process still running as it?)${NC}\n"
+            FAILED=1
+        fi
+    else
+        skip_step "$SVC_USER user"
+    fi
+    if getent group "$SVC_GROUP" >/dev/null 2>&1; then
+        if groupdel "$SVC_GROUP" >/dev/null 2>&1; then
+            done_step "Deleted the $SVC_GROUP group"
+        else
+            printf '%b' "${YELLOW}⚠️  Could not delete the $SVC_GROUP group (is a process still running as it?)${NC}\n"
+            FAILED=1
+        fi
+    fi
+
+    printf '\n'
+    if [ "$FAILED" -eq 1 ]; then
+        printf '%b' "${RED}Uninstall incomplete: see the ⚠️ lines above.${NC}\n"
+        exit 1
+    fi
+    if [ "$ACTED" -eq 1 ]; then
+        printf '%b' "${GREEN}✅ Uninstalled. Now open the dashboard and click Remove for this server.${NC}\n"
+    else
+        printf '%b' "Nothing to remove: the Monitorable agent is not installed on this server.\n"
+    fi
+    exit 0
+fi
+
+# Key-free re-run = update: take what was not given explicitly from the agent.env this
+# script wrote on the first install. Parsed, never sourced: the file is root-owned 0600,
+# but a sourced file executes, and the values still go through the same checks below.
+env_value() {
+    # $1 is one of two constant names, never user input.
+    sed -n "s/^$1=//p" "$AGENT_ENV" | head -n 1
+}
+KEY_FROM_AGENT_ENV=0
+if [ -f "$AGENT_ENV" ]; then
+    if [ -z "$API_KEY" ]; then
+        API_KEY="$(env_value MONITORABLE_API_KEY)"
+        [ -n "$API_KEY" ] && KEY_FROM_AGENT_ENV=1
+    fi
+    if [ -z "$ENDPOINT" ]; then
+        ENDPOINT="$(env_value MONITORABLE_ENDPOINT)"
+    fi
+fi
+[ -n "$ENDPOINT" ] || ENDPOINT="$DEFAULT_ENDPOINT"
+
+if [ -z "$API_KEY" ]; then
+    printf '%b' "${RED}No agent is installed on this server. Add the server in the dashboard to get its install command.${NC}\n"
+    printf '%b' "If an older agent is installed, re-run its original install command once.\n"
+    exit 1
+fi
+if [ "$KEY_FROM_AGENT_ENV" -eq 1 ]; then
+    printf '%b' "${BLUE}🔁 Updating the existing agent (API key and endpoint from $AGENT_ENV)${NC}\n"
 fi
 
 # The key and the endpoint are written verbatim into agent.env, and systemd hands every
@@ -130,12 +260,6 @@ printf '%s\n' "$ENDPOINT"
 printf '%b' "${BLUE}Version:${NC} "
 printf '%s\n' "$VERSION"
 printf '\n'
-
-# Check if running as root
-if [ "$(id -u)" -ne 0 ]; then
-   printf '%b' "${RED}This script must be run as root (use sudo)${NC}\n"
-   exit 1
-fi
 
 # Detect OS and architecture
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
