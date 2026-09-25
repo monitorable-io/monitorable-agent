@@ -16,6 +16,7 @@
 # and in sudo's auth.log — prefer the root-shell form wherever you can.
 # Optional: --endpoint=https://ingest.monitorable.net (default), --version=vX.Y.Z
 # Update (key and endpoint from /etc/monitorable/agent.env): curl -fsSL @@BASE_URL@@/install.sh | sudo sh
+# Uninstall: curl -fsSL @@BASE_URL@@/install.sh | sudo sh -s -- --uninstall
 
 set -e
 
@@ -59,6 +60,8 @@ VERSION="latest"
 # the rest of this script and every child process.
 SVC_USER="monitorable"
 SVC_GROUP="monitorable"
+UNINSTALL=0
+OTHER_OPTS=0
 
 printf '%b' "${BLUE}🚀 Monitorable agent installer${NC}\n"
 printf '%b' "${BLUE}================================${NC}\n"
@@ -68,14 +71,21 @@ while [ $# -gt 0 ]; do
     case $1 in
         --endpoint=*)
             ENDPOINT="${1#*=}"
+            OTHER_OPTS=1
             shift
             ;;
         --api-key=*)
             API_KEY="${1#*=}"
+            OTHER_OPTS=1
             shift
             ;;
         --version=*)
             VERSION="${1#*=}"
+            OTHER_OPTS=1
+            shift
+            ;;
+        --uninstall)
+            UNINSTALL=1
             shift
             ;;
         *)
@@ -88,10 +98,75 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ "$UNINSTALL" -eq 1 ] && [ "$OTHER_OPTS" -eq 1 ]; then
+    printf '%b' "${RED}--uninstall takes no other options${NC}\n"
+    exit 1
+fi
+
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
    printf '%b' "${RED}This script must be run as root (use sudo)${NC}\n"
    exit 1
+fi
+
+if [ "$UNINSTALL" -eq 1 ]; then
+    printf '%b' "${YELLOW}🧹 Uninstalling the Monitorable agent...${NC}\n"
+    ACTED=0
+    done_step() { printf '%b' "${GREEN}✓${NC} $1\n"; ACTED=1; }
+    skip_step() { printf '%b' "· $1: not present\n"; }
+
+    # monitorable-collector = the pre-rename unit (<= v1.1.x).
+    for unit in monitorable-agent monitorable-collector; do
+        if [ -f "/etc/systemd/system/$unit.service" ]; then
+            systemctl disable --now "$unit" >/dev/null 2>&1 || true
+            rm -f "/etc/systemd/system/$unit.service"
+            done_step "Stopped and removed the $unit service"
+        else
+            skip_step "$unit service"
+        fi
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed monitorable-agent monitorable-collector >/dev/null 2>&1 || true
+
+    # Binary, configuration (incl. the API key), state (incl. the unsent queue), logs.
+    for dir in /opt/monitorable /etc/monitorable /var/lib/monitorable /var/log/monitorable; do
+        if [ -e "$dir" ]; then
+            rm -rf "$dir"
+            done_step "Deleted $dir"
+        else
+            skip_step "$dir"
+        fi
+    done
+
+    UDEV_RULE=/etc/udev/rules.d/99-monitorable-nvme-smart.rules
+    if [ -f "$UDEV_RULE" ]; then
+        rm -f "$UDEV_RULE"
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules >/dev/null 2>&1 || true
+        fi
+        done_step "Removed the NVMe SMART udev rule"
+    else
+        skip_step "NVMe SMART udev rule"
+    fi
+
+    if getent passwd "$SVC_USER" >/dev/null 2>&1; then
+        userdel "$SVC_USER" >/dev/null 2>&1 || true
+        done_step "Deleted the $SVC_USER user"
+    else
+        skip_step "$SVC_USER user"
+    fi
+    if getent group "$SVC_GROUP" >/dev/null 2>&1; then
+        groupdel "$SVC_GROUP" >/dev/null 2>&1 || true
+        done_step "Deleted the $SVC_GROUP group"
+    fi
+
+    printf '\n'
+    if [ "$ACTED" -eq 1 ]; then
+        printf '%b' "${GREEN}✅ Uninstalled. Now open the dashboard and click Remove for this server.${NC}\n"
+    else
+        printf '%b' "Nothing to remove: the Monitorable agent is not installed on this server.\n"
+    fi
+    exit 0
 fi
 
 # Key-free re-run = update: take what was not given explicitly from the agent.env this

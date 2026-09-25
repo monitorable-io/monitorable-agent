@@ -50,8 +50,25 @@ rc=$(run_rc "sh /root/install.sh")
 check env-without-key '[ "$rc" != 0 ] && out_has "No agent is installed on this server"'
 run "cp /root/agent.env.bak /etc/monitorable/agent.env"
 
-# Task 2 appends the --uninstall cases here (UNINSTALL-CASES marker)
-# UNINSTALL-CASES
+# --uninstall refuses other options
+rc=$(run_rc "sh /root/install.sh --uninstall --version=v1.2.0")
+check uninstall-rejects-options '[ "$rc" = 1 ] && out_has "--uninstall takes no other options"'
+
+# --uninstall on a failed unit still removes everything
+# make the unit fail: swap the binary for /bin/false and restart. The running binary's
+# inode can't be overwritten in place (ETXTBSY) while the unit is up, so stop it first.
+run "systemctl stop monitorable-agent; cp /bin/false /opt/monitorable/monitorable-agent && systemctl restart monitorable-agent" || true
+rc=$(run_rc "sh /root/install.sh --uninstall")
+check uninstall-failed-unit '[ "$rc" = 0 ] && out_has "Uninstalled. Now open the dashboard"'
+check uninstall-leaves-nothing '! run "test -e /opt/monitorable || test -e /etc/monitorable || test -e /var/lib/monitorable || test -e /var/log/monitorable || test -e /etc/systemd/system/monitorable-agent.service || test -e /etc/udev/rules.d/99-monitorable-nvme-smart.rules || getent passwd monitorable || getent group monitorable"'
+
+# second --uninstall is a no-op
+rc=$(run_rc "sh /root/install.sh --uninstall")
+check uninstall-idempotent '[ "$rc" = 0 ] && out_has "Nothing to remove"'
+
+# key-free run on a clean host
+rc=$(run_rc "sh /root/install.sh")
+check keyfree-on-clean-host '[ "$rc" = 1 ] && out_has "No agent is installed on this server"'
 
 printf '%s failure(s)\n' "$FAILS"
 [ "$FAILS" -eq 0 ]
