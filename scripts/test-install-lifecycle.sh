@@ -74,5 +74,19 @@ check uninstall-idempotent '[ "$rc" = 0 ] && out_has "Nothing to remove"'
 rc=$(run_rc "sh /root/install.sh")
 check keyfree-on-clean-host '[ "$rc" = 1 ] && out_has "No agent is installed on this server"'
 
+# --uninstall reports a failed delete instead of aborting outright under set -e.
+# chattr +i needs CAP_LINUX_IMMUTABLE, which this unprivileged LXD container's profile
+# denies (verified: chattr +i -> "Operation not permitted"), so the obstruction here is a
+# tmpfs remounted read-only over /etc/monitorable: rm -rf's unlink of the files inside it
+# then hits a genuine EROFS failure.
+run "sh /root/install.sh --endpoint=$ENDPOINT --api-key=$KEY >/dev/null 2>&1"
+run "mount -t tmpfs tmpfs /etc/monitorable && echo obstruction > /etc/monitorable/keepme && mount -o remount,ro /etc/monitorable"
+rc=$(run_rc "sh /root/install.sh --uninstall")
+check uninstall-rm-failure '[ "$rc" = 1 ] && out_has "Uninstall incomplete" && out_has "Could not delete /etc/monitorable"'
+# undo the obstruction and finish the uninstall so the host is left clean
+run "mount -o remount,rw /etc/monitorable && rm -f /etc/monitorable/keepme && umount /etc/monitorable"
+rc=$(run_rc "sh /root/install.sh --uninstall")
+check uninstall-rm-failure-cleanup '[ "$rc" = 0 ] && ! run "test -e /etc/monitorable"'
+
 printf '%s failure(s)\n' "$FAILS"
 [ "$FAILS" -eq 0 ]

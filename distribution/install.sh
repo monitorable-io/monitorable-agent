@@ -123,8 +123,12 @@ if [ "$UNINSTALL" -eq 1 ]; then
     for unit in monitorable-agent monitorable-collector; do
         systemctl disable --now "$unit" >/dev/null 2>&1 || true
         if [ -f "/etc/systemd/system/$unit.service" ]; then
-            rm -f "/etc/systemd/system/$unit.service"
-            done_step "Stopped and removed the $unit service"
+            if rm -f "/etc/systemd/system/$unit.service"; then
+                done_step "Stopped and removed the $unit service"
+            else
+                printf '%b' "${YELLOW}⚠️  Could not remove the $unit service file${NC}\n"
+                FAILED=1
+            fi
         else
             skip_step "$unit service"
         fi
@@ -135,8 +139,12 @@ if [ "$UNINSTALL" -eq 1 ]; then
     # Binary, configuration (incl. the API key), state (incl. the unsent queue), logs.
     for dir in /opt/monitorable /etc/monitorable /var/lib/monitorable /var/log/monitorable; do
         if [ -e "$dir" ]; then
-            rm -rf "$dir"
-            done_step "Deleted $dir"
+            if rm -rf "$dir"; then
+                done_step "Deleted $dir"
+            else
+                printf '%b' "${YELLOW}⚠️  Could not delete $dir${NC}\n"
+                FAILED=1
+            fi
         else
             skip_step "$dir"
         fi
@@ -144,11 +152,15 @@ if [ "$UNINSTALL" -eq 1 ]; then
 
     UDEV_RULE=/etc/udev/rules.d/99-monitorable-nvme-smart.rules
     if [ -f "$UDEV_RULE" ]; then
-        rm -f "$UDEV_RULE"
-        if command -v udevadm >/dev/null 2>&1; then
-            udevadm control --reload-rules >/dev/null 2>&1 || true
+        if rm -f "$UDEV_RULE"; then
+            if command -v udevadm >/dev/null 2>&1; then
+                udevadm control --reload-rules >/dev/null 2>&1 || true
+            fi
+            done_step "Removed the NVMe SMART udev rule"
+        else
+            printf '%b' "${YELLOW}⚠️  Could not remove the NVMe SMART udev rule${NC}\n"
+            FAILED=1
         fi
-        done_step "Removed the NVMe SMART udev rule"
     else
         skip_step "NVMe SMART udev rule"
     fi
