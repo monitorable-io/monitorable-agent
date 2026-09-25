@@ -58,6 +58,10 @@ check uninstall-rejects-options '[ "$rc" = 1 ] && out_has "--uninstall takes no 
 # make the unit fail: swap the binary for /bin/false and restart. The running binary's
 # inode can't be overwritten in place (ETXTBSY) while the unit is up, so stop it first.
 run "systemctl stop monitorable-agent; cp /bin/false /opt/monitorable/monitorable-agent && systemctl restart monitorable-agent" || true
+# Assert the precondition actually holds (the unit is genuinely not healthy) so this case
+# can't pass vacuously if the swap above ever silently stops working again.
+sleep 2
+check failed-unit-precondition '! run "systemctl is-active --quiet monitorable-agent"'
 rc=$(run_rc "sh /root/install.sh --uninstall")
 check uninstall-failed-unit '[ "$rc" = 0 ] && out_has "Uninstalled. Now open the dashboard"'
 check uninstall-leaves-nothing '! run "test -e /opt/monitorable || test -e /etc/monitorable || test -e /var/lib/monitorable || test -e /var/log/monitorable || test -e /etc/systemd/system/monitorable-agent.service || test -e /etc/udev/rules.d/99-monitorable-nvme-smart.rules || getent passwd monitorable || getent group monitorable"'

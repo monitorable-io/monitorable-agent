@@ -112,13 +112,17 @@ fi
 if [ "$UNINSTALL" -eq 1 ]; then
     printf '%b' "${YELLOW}🧹 Uninstalling the Monitorable agent...${NC}\n"
     ACTED=0
+    FAILED=0
     done_step() { printf '%b' "${GREEN}✓${NC} $1\n"; ACTED=1; }
     skip_step() { printf '%b' "· $1: not present\n"; }
 
-    # monitorable-collector = the pre-rename unit (<= v1.1.x).
+    # monitorable-collector = the pre-rename unit (<= v1.1.x). disable --now runs
+    # unconditionally for both names (harmless no-op on an unknown unit) so a unit whose
+    # file was hand-deleted while it still runs gets stopped too; the file test below only
+    # decides whether there's a file left to remove and which line to print.
     for unit in monitorable-agent monitorable-collector; do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
         if [ -f "/etc/systemd/system/$unit.service" ]; then
-            systemctl disable --now "$unit" >/dev/null 2>&1 || true
             rm -f "/etc/systemd/system/$unit.service"
             done_step "Stopped and removed the $unit service"
         else
@@ -150,17 +154,29 @@ if [ "$UNINSTALL" -eq 1 ]; then
     fi
 
     if getent passwd "$SVC_USER" >/dev/null 2>&1; then
-        userdel "$SVC_USER" >/dev/null 2>&1 || true
-        done_step "Deleted the $SVC_USER user"
+        if userdel "$SVC_USER" >/dev/null 2>&1; then
+            done_step "Deleted the $SVC_USER user"
+        else
+            printf '%b' "${YELLOW}⚠️  Could not delete the $SVC_USER user (is a process still running as it?)${NC}\n"
+            FAILED=1
+        fi
     else
         skip_step "$SVC_USER user"
     fi
     if getent group "$SVC_GROUP" >/dev/null 2>&1; then
-        groupdel "$SVC_GROUP" >/dev/null 2>&1 || true
-        done_step "Deleted the $SVC_GROUP group"
+        if groupdel "$SVC_GROUP" >/dev/null 2>&1; then
+            done_step "Deleted the $SVC_GROUP group"
+        else
+            printf '%b' "${YELLOW}⚠️  Could not delete the $SVC_GROUP group (is a process still running as it?)${NC}\n"
+            FAILED=1
+        fi
     fi
 
     printf '\n'
+    if [ "$FAILED" -eq 1 ]; then
+        printf '%b' "${RED}Uninstall incomplete: see the ⚠️ lines above.${NC}\n"
+        exit 1
+    fi
     if [ "$ACTED" -eq 1 ]; then
         printf '%b' "${GREEN}✅ Uninstalled. Now open the dashboard and click Remove for this server.${NC}\n"
     else
