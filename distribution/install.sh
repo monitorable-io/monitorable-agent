@@ -430,6 +430,10 @@ fetch() {
         *) curl -fsSL "$1" -o "$2" ;;
     esac
 }
+# Start from no staged files at all: a .tmp left in a directory that a non-root user owned
+# before the chown above could be a hard link to an inode that user owns, and curl -o
+# writes into an existing file rather than replacing it.
+cleanup_tmp
 if ! fetch "$COLLECTOR_URL" "$TMP_BIN" ||
    ! fetch "$SUMS_URL" "$TMP_SUMS" ||
    ! fetch "$CONFIG_URL" "$TMP_CONFIG" ||
@@ -439,11 +443,12 @@ if ! fetch "$COLLECTOR_URL" "$TMP_BIN" ||
     exit 1
 fi
 
-# The signature is fetched separately so its absence says so: a missing .sig is never
-# "unsigned mode" — every release since v1.3.0 carries one.
+# The signature is fetched separately so its failure says so: a missing .sig is never
+# "unsigned mode" — every release since v1.3.0 carries one. curl cannot tell a 404 from a
+# network or TLS failure here, so the message names both.
 if ! fetch "$SIG_URL" "$TMP_SIG"; then
     cleanup_tmp
-    printf '%b' "${RED}❌ SHA256SUMS.sig is missing: this release is not signed. Nothing was installed.${NC}\n"
+    printf '%b' "${RED}❌ Could not download SHA256SUMS.sig — this release is unsigned or the download failed. Nothing was installed.${NC}\n"
     exit 1
 fi
 # SHA256SUMS is trusted only once its signature verifies against the key embedded in this
@@ -461,13 +466,16 @@ if ! openssl dgst -sha256 -verify "$TMP_PUB" -signature "$TMP_SIG" "$TMP_SUMS" >
 fi
 
 # version_ge A B: true when release A >= release B. Both must be vMAJOR.MINOR.PATCH with
-# numeric parts; anything else is false, so a malformed version fails closed. Compared
-# per component as integers: v1.10.0 is newer than v1.9.0.
+# numeric parts of at most 9 digits; anything else is false, so a malformed version fails
+# closed. Compared per component as integers: v1.10.0 is newer than v1.9.0. The digit cap
+# keeps every component inside the shell's integer range: a longer one makes `[` error out,
+# and inside `if` that error reads as "not equal" and falls through to the next component.
 version_ge() {
     for _v in "$1" "$2"; do
         case "$_v" in v?*) ;; *) return 1 ;; esac
         case "${_v#v}" in
             *[!0-9.]*|*.*.*.*|*..*|.*|*.) return 1 ;;
+            *[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 1 ;;
             *.*.*) ;;
             *) return 1 ;;
         esac
