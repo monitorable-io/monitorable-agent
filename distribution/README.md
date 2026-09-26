@@ -11,8 +11,13 @@ Version-controlled source for the Monitorable agent distribution served at the
 
 ## Contents
 
-- `install.sh` — Linux installer. `BASE_URL="@@BASE_URL@@"` is a publish-time
-  placeholder baked per env by `scripts/publish-dist.sh`. The API key comes from
+- `install.sh` — Linux installer template with three placeholders: `@@BASE_URL@@` (the
+  env's download host), `@@SIGNING_PUBKEY@@` (the env's release-signing public key, one
+  line of base64 DER) and `@@MIN_VERSION@@` (the oldest release it accepts as `latest`).
+  The backend fills the first two when it serves the script and the third when it vendors
+  it; for the transitional copy on R2, `scripts/publish-dist.sh` fills all three
+  (`MIN_VERSION` = the release being published). A copy with any placeholder left refuses
+  to run. The API key comes from
   `MONITORABLE_API_KEY` in the environment (preferred — an argv value is world-readable in
   `/proc/<pid>/cmdline` and is written to `auth.log` by sudo) or from `--api-key=`, which
   overrides it. The environment form is `sudo -s` to get a root shell, then `export
@@ -35,7 +40,9 @@ Binaries and `SHA256SUMS` are **not** committed — `scripts/publish-dist.sh`
 cross-compiles the binaries fresh and writes the checksums alongside them.
 
 **Published surface is Linux-only** (amd64 + arm64) — the live `get.*` surface serves
-`install.sh`, `configs/linux/`, the linux binaries, and `SHA256SUMS`.
+`install.sh`, `configs/linux/`, the linux binaries, `SHA256SUMS` and `SHA256SUMS.sig`
+(binaries and both sums files under `binaries/otel/<version>/` and `binaries/otel/latest/`),
+and `latest.json`.
 
 ## Integrity
 
@@ -55,19 +62,23 @@ object, and only then moves anything into place. The unit template matters as mu
 binary: it is sed-rendered into `/etc/systemd/system` and `daemon-reload`ed, so an
 unverified one is an arbitrary `ExecStart=`.
 
-`publish-dist.sh` uploads binaries → configs → `SHA256SUMS`, sums strictly last, so an
-install racing a publish sees at worst the previous, self-consistent set rather than new
-checksums over old payloads.
+`publish-dist.sh` uploads binaries → configs → `SHA256SUMS.sig` → `SHA256SUMS` →
+`install.sh` (then `latest.json`). The sums follow every payload they cover, so an install
+racing a publish fails closed rather than installing new checksums over old payloads.
+`install.sh` follows the sums because its `MIN_VERSION` is the new release: published
+first, it would refuse every install until the new signed sums arrived, whereas the old
+installer, with its lower floor, accepts them.
 
 Around that check:
 
 - Nothing is touched before the preflights pass (root, Linux, amd64/arm64, `curl`,
-  `sha256sum`, a running systemd). A host without systemd is refused with zero side
-  effects.
+  `sha256sum`, `openssl`, a running systemd). A host without systemd is refused with zero
+  side effects.
 - With an `https://` base URL every download is `--proto =https --tlsv1.2`, so a redirect
   cannot downgrade a transfer to cleartext. The dev `http://` origin keeps plain curl.
-- The output prints the verified binary's sha256. Each release's `SHA256SUMS` is also
-  attached to its GitHub release, so it can be checked against a second origin.
+- The output prints the verified binary's sha256. Each release's `SHA256SUMS` (and its
+  staging-key `SHA256SUMS.sig`) is also attached to its GitHub release, so it can be
+  checked against a second origin.
 - The service user, group and docker membership are created only after verification, so a
   failed fresh install leaves no account behind (only the empty `/opt/monitorable` and
   `/etc/monitorable` the downloads were staged in).
@@ -75,12 +86,16 @@ Around that check:
 `SHA256SUMS` starts with one `# version vX.Y.Z` line and is signed (openssl ECDSA P-256,
 `SHA256SUMS.sig`) with a per-environment key that exists only in this repo's GitHub
 environments (and an offline backup). The public keys are committed at `distribution/keys/`.
-`install.sh` is **served by the Monitorable backend** (`https://get.monitorable.net/install.sh`,
-staging `https://install-mon.ok9k.com/install.sh`), which embeds the public key. The script
-verifies the signature, then requires the signed version to be ≥ its `MIN_VERSION` (or to
-equal `--version=`), then checks every file against the authenticated sums. Writing this
-download bucket is therefore not enough to get code onto a host: that needs the signing key
-too. Verify a release yourself:
+The script verifies the signature, then requires the signed version to be ≥ its
+`MIN_VERSION` (or to equal `--version=`), then checks every file against the authenticated
+sums. The trust anchor is wherever `install.sh` itself comes from. Fetched from the
+Monitorable backend (`https://get.monitorable.net/install.sh`, staging
+`https://install-mon.ok9k.com/install.sh`), which embeds the public key, writing this
+download bucket is not enough to get code onto a host: that needs the signing key too.
+During the transition the copy at `<get host>/install.sh` on R2 verifies signatures the
+same way but is itself anchored in the bucket — whoever can write the bucket can replace
+it — until the backend serves the installer and that object is replaced by a stub that
+points at the backend (`STUB_INSTALLER=1`). Verify a release yourself:
 `openssl dgst -sha256 -verify distribution/keys/prod.pub -signature SHA256SUMS.sig SHA256SUMS`.
 Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the platform repo.
 
@@ -90,7 +105,11 @@ Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the p
 scripts/publish-dist.sh staging --preflight      # prove the credentials can write the bucket (put+delete one object)
 scripts/publish-dist.sh staging                  # build + render + upload to R2
 scripts/publish-dist.sh staging --render-only    # build + render into ./distribution-build, no upload
+scripts/publish-dist.sh staging --check-installer  # does the backend serve an installer with this env's key? (gates STUB_INSTALLER=1)
 ```
+
+A build needs `VERSION=vX.Y.Z` (the release job passes the pushed tag; anything else is
+refused before signing) and `RELEASE_SIGNING_KEY`, which must match `distribution/keys/<env>.pub`.
 
 Uploads go over R2's **S3 API** with the AWS CLI (preinstalled on GitHub runners). The
 credentials are `CLOUDFLARE_R2_TOKEN` — an R2 API token with **Object Read & Write**
@@ -110,8 +129,10 @@ workflow **on `main`** with `target=publish-prod`, `tag=<that released tag>` and
 ref, so the job checks out the tag's tree itself instead of being dispatched on it (job
 `publish-prod` → `scripts/publish-dist.sh prod`, under the `production` GitHub
 environment, which holds an R2 token scoped to the prod bucket only). A plain dispatch
-(`target=prune-staging`) only enforces R2 retention on staging. There is no merge-to-main
-publish. A config-only change therefore still needs a new tag, and reaches a host only
+(`target=prune-staging`) only enforces R2 retention on staging. `publish-prod` can only
+publish tags from v1.3.0 on: an older tag's tree has no `distribution/keys/prod.pub`, so
+`publish-dist.sh` stops with "no public key" — there is no prod rollback to v1.2.x through
+`publish-prod`. There is no merge-to-main publish. A config-only change therefore still needs a new tag, and reaches a host only
 when it is reinstalled — collectors never auto-update.
 
 Every `put` is retried (5 attempts, linear backoff), and after the last object the script
@@ -137,9 +158,9 @@ back.
 
 ### The publish window
 
-`SHA256SUMS` is uploaded last, but the upload as a whole is not atomic: for the few minutes
-it takes, the bucket holds a mix of new and old objects and the sums match only one of
-them. A fresh install started inside that window therefore aborts on a checksum mismatch
+`SHA256SUMS` is uploaded after every payload it covers, but the upload as a whole is not
+atomic: for the few minutes it takes, the bucket holds a mix of new and old objects and the
+sums match only one of them. A fresh install started inside that window therefore aborts on a checksum mismatch
 without touching the host — fail-closed by design — and simply needs to be retried once the
 release job reports success. Existing agents are unaffected; they never re-download.
 
@@ -150,7 +171,9 @@ The config and unit objects on R2 are unversioned while binaries are versioned, 
 a checksum mismatch — the installer stops before touching the running install — instead of
 installing a v1.1.23 config next to a v1.1.22 binary that has no `file_storage` type and
 crash-looping the host. Rolling back below the current config requires republishing the
-matching (pre-rollback) config, unit and `SHA256SUMS` for that version.
+matching (pre-rollback) config, unit and `SHA256SUMS` for that version. A signing
+installer also refuses any `--version=` below v1.3.0: those releases have no
+`SHA256SUMS.sig` and no signed version line.
 
 `--version=` below v1.2.0 (the rename release) cannot work either way: those older
 version prefixes on R2 hold objects under the pre-rename binary name
