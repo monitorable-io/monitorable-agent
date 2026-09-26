@@ -120,6 +120,11 @@ jobs:
                   BUNNY_STORAGE_PASSWORD=SECRET-0123 bunny_curl -X PUT https://example.invalid/z/f' _ "$bunny")"
           if grep -q 'SECRET-0123' <<<"$argv"; then echo "FAIL: the Bunny password is in curl's argv"; exit 1; fi
           grep -qx -- '-K' <<<"$argv"
+          # --preflight must refuse a missing Bunny password before its R2 probe runs, not
+          # after: unset the R2 credentials too, so a wrong ordering surfaces as the R2
+          # message instead of a false pass.
+          refuses "BUNNY_STORAGE_PASSWORD is not set" env -u BUNNY_STORAGE_PASSWORD -u CLOUDFLARE_R2_TOKEN -u CLOUDFLARE_API_TOKEN \
+            scripts/publish-dist.sh staging --preflight
       - name: Cross-compile smoke (linux amd64+arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/agent-amd64 ./cmd/monitorable-agent

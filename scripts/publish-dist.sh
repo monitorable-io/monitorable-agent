@@ -136,6 +136,7 @@ bunny_put() { # localpath name
 }
 
 if [ "$MODE" = "--preflight" ]; then
+  bunny_require_password
   r2_auth
   printf 'preflight %s %s\n' "$ENV" "$(date -u +%FT%TZ)" > "${TMPDIR:-/tmp}/r2-preflight.txt"
   if ! s3 s3 cp "${TMPDIR:-/tmp}/r2-preflight.txt" "s3://${BUCKET}/.preflight" --content-type text/plain --no-progress; then
@@ -143,7 +144,6 @@ if [ "$MODE" = "--preflight" ]; then
     exit 1
   fi
   r2_delete ".preflight" || echo "note: could not delete ${BUCKET}/.preflight (harmless)"
-  bunny_require_password
   if ! bunny_put "${TMPDIR:-/tmp}/r2-preflight.txt" ".preflight"; then
     echo "ERROR: BUNNY_STORAGE_PASSWORD cannot write zone ${BUNNY_STORAGE_ZONE} on ${BUNNY_STORAGE_HOST}: check the zone name, its region host and the password" >&2
     exit 1
