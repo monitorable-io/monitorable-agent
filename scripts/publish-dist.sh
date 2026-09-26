@@ -11,6 +11,9 @@
 #   --check-installer : check whether this env's backend already serves an installer that
 #                       embeds this env's signing key (gates STUB_INSTALLER); no build, no key.
 #
+# VERSION (env) must be a plain release tag vX.Y.Z for a build (the release job passes the
+# pushed tag); --preflight, --prune-only and --check-installer do not use it.
+#
 # Credentials (env): CLOUDFLARE_R2_TOKEN = an R2 API token with "Object Read & Write"
 # scoped to THIS env's bucket only, and CLOUDFLARE_ACCOUNT_ID. Uploads go over R2's S3
 # API with the AWS CLI; the S3 credentials are derived from the token as Cloudflare
@@ -133,12 +136,29 @@ PUBKEY_LINE="$(pem_body < "$EXPECTED_PUBKEY_FILE")"
 
 # installer_serves_key: true when this env's backend serves an installer that embeds THIS
 # env's key. Gates the stub, so R2 never loses the real installer before the backend has it.
+# The body is fetched completely before it is matched, and the matcher reads ALL of its
+# input (grep -c, never -q): under pipefail, a reader that stops at the first match kills
+# its writer with SIGPIPE once the rest of the body outgrows the pipe buffer, and the
+# pipeline then reports a served key as "not served". validate.yml tests the matcher.
+installer_body_has_key() {
+  [ "$(grep -cF -- "SIGNING_PUBKEY=\"$PUBKEY_LINE\"")" -gt 0 ]
+}
 installer_serves_key() {
-  curl --proto '=https' --tlsv1.2 -fsS "$INSTALLER_URL/install.sh" | grep -qF "SIGNING_PUBKEY=\"$PUBKEY_LINE\""
+  local body
+  body="$(curl --proto '=https' --tlsv1.2 -fsS "$INSTALLER_URL/install.sh")" || return 1
+  installer_body_has_key <<<"$body"
 }
 if [ "$MODE" = "--check-installer" ]; then
   if installer_serves_key; then echo "installer OK: $INSTALLER_URL/install.sh embeds this env's key"; exit 0; fi
   echo "ERROR: $INSTALLER_URL/install.sh is not live with this env's signing key" >&2; exit 1
+fi
+
+# VERSION becomes the installer's MIN_VERSION and the signed `# version` line, and install.sh
+# accepts only vX.Y.Z: anything else (a pre-release tag, the unset default "dev") would
+# brick every latest install, and a `|` or `&` in it would corrupt the sed rendering below.
+# Components are capped at 9 digits, as install.sh's version_ge caps them.
+if ! [[ "$VERSION" =~ ^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ ]]; then
+  echo "ERROR: VERSION must look like vX.Y.Z (got '$VERSION')" >&2; exit 1
 fi
 
 if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
@@ -147,6 +167,9 @@ fi
 SIGNING_KEY_FILE="$(mktemp)"
 trap 'rm -f "$SIGNING_KEY_FILE"' EXIT
 printf '%s\n' "$RELEASE_SIGNING_KEY" > "$SIGNING_KEY_FILE"
+# From here on only the 0600 temp file holds the key: nothing this script runs (go build,
+# openssl, aws, curl) inherits it through the environment.
+unset RELEASE_SIGNING_KEY
 if [ "$(openssl pkey -in "$SIGNING_KEY_FILE" -pubout 2>/dev/null | pem_body)" != "$PUBKEY_LINE" ]; then
   echo "ERROR: RELEASE_SIGNING_KEY does not match $EXPECTED_PUBKEY_FILE — refusing to sign" >&2; exit 1
 fi
@@ -244,15 +267,18 @@ put() { # localpath key content-type
     attempt=$((attempt + 1))
   done
 }
-put "$OUT/install.sh" "install.sh" "text/x-shellscript"
 
-# Publish order is binaries → configs → SHA256SUMS.sig → SHA256SUMS, and SHA256SUMS is strictly last.
-# install.sh verifies the binary, the config AND the unit against that one object, so any
+# Publish order is binaries → configs → SHA256SUMS.sig → SHA256SUMS → install.sh.
+# install.sh verifies the binary, the config AND the unit against the one SHA256SUMS, so any
 # install that races this publish FAILS CLOSED — a new config or binary against the old
 # sums (or the reverse) aborts before anything is touched, and the operator retries. The
-# window is the length of this upload, a few minutes. Sums last keeps that window as short
-# as possible and keeps the previous set installable for as much of it as possible; it
-# does not eliminate it. Signed, versioned config objects would; see distribution/README.md.
+# window is the length of this upload, a few minutes. Sums after the payloads keeps that
+# window as short as possible and keeps the previous set installable for as much of it as
+# possible; it does not eliminate it. Signed, versioned config objects would; see
+# distribution/README.md. install.sh goes after the sums: the new installer's MIN_VERSION is
+# this release, so it must not go live before the signed sums that satisfy it (it would
+# refuse every install for the whole upload, and for good if a later put failed), while the
+# old installer, with its lower floor, accepts the new sums.
 # (Fail loud if the build produced no binaries, rather than uploading a literal glob.)
 shopt -s nullglob
 bins=("$BINOUT"/monitorable-agent-linux-*)
@@ -282,15 +308,12 @@ put "$BINOUT/SHA256SUMS.sig" "binaries/otel/${VERSION}/SHA256SUMS.sig" "applicat
 put "$BINOUT/SHA256SUMS.sig" "binaries/otel/latest/SHA256SUMS.sig"     "application/octet-stream"
 put "$BINOUT/SHA256SUMS" "binaries/otel/${VERSION}/SHA256SUMS" "text/plain"
 put "$BINOUT/SHA256SUMS" "binaries/otel/latest/SHA256SUMS"     "text/plain"
+put "$OUT/install.sh" "install.sh" "text/x-shellscript"
 
 # 4b. Version manifest — the backend reads this (GET /latest.json) to compare
 # each server's reported agent version against the newest published one.
-if [ "$VERSION" = "dev" ]; then
-  echo "WARN: VERSION=dev — skipping latest.json (publish from a v* tag to update it)"
-else
-  printf '{"version":"%s"}\n' "$VERSION" > "$OUT/latest.json"
-  put "$OUT/latest.json" "latest.json" "application/json"
-fi
+printf '{"version":"%s"}\n' "$VERSION" > "$OUT/latest.json"
+put "$OUT/latest.json" "latest.json" "application/json"
 
 echo "published ${ENV} distribution to ${BUCKET}"
 
@@ -317,9 +340,7 @@ verify_published() {
   for f in "${bins[@]}"; do
     pairs+=("binaries/otel/${VERSION}/$(basename "$f")=$f" "binaries/otel/latest/$(basename "$f")=$f")
   done
-  if [ "$VERSION" != "dev" ]; then
-    pairs+=("latest.json=$OUT/latest.json")
-  fi
+  pairs+=("latest.json=$OUT/latest.json")
   local pair
   for pair in "${pairs[@]}"; do
     key="${pair%%=*}"; local_path="${pair#*=}"
