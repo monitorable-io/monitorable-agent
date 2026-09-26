@@ -50,7 +50,6 @@ jobs:
     env:
       CLOUDFLARE_R2_TOKEN: ${{ secrets.CLOUDFLARE_R2_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,6 +67,11 @@ jobs:
       - name: Publish versioned distribution to staging R2
         if: github.event_name == 'push'
         run: scripts/publish-dist.sh staging
+        # The signing key reaches this one step only: not the test gate (go test runs
+        # dependency init code), not the preflight. publish-dist.sh moves it into a 0600
+        # temp file and unsets it before building.
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       - name: Enforce R2 retention only (manual dispatch)
         if: github.event_name == 'workflow_dispatch'
         run: scripts/publish-dist.sh staging --prune-only
@@ -97,7 +101,6 @@ jobs:
     env:
       CLOUDFLARE_R2_TOKEN: ${{ secrets.CLOUDFLARE_R2_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       VERSION: ${{ inputs.tag }}
     steps:
       - name: Refuse unless confirmed and the tag is well-formed
@@ -145,6 +148,9 @@ jobs:
         run: scripts/publish-dist.sh prod --preflight
       - name: Publish versioned distribution to prod R2 (get.monitorable.io)
         run: scripts/publish-dist.sh prod
+        # Step-scoped, as in the staging job: the test gate never sees the signing key.
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       - name: Record what was published
         env:
           TAG: ${{ inputs.tag }}
