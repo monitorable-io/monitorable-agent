@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Build Monitorable agent binaries, render install.sh for the target env, and publish
-# the full distribution (install.sh + configs + binaries) to that env's R2 bucket.
+# Build Monitorable agent binaries, render install.sh for the target env, publish the full
+# distribution (install.sh + configs + binaries) to that env's R2 bucket, and upload the
+# rendered installer to that env's Bunny installer zone.
 #
 # Usage: scripts/publish-dist.sh <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]
-#   --render-only     : build + render into ./distribution-build, skip R2 upload
-#                       (CI dry-run / local test; no Cloudflare creds needed).
+#   --render-only     : build + render into ./distribution-build, skip R2/Bunny upload
+#                       (CI dry-run / local test; no Cloudflare or Bunny creds needed).
 #   --prune-only      : enforce R2 retention only (delete old versioned binaries), no build/publish
-#   --preflight       : prove the credentials can write this env's bucket (put + delete one
-#                       tiny object) and exit; no build. The release jobs run this first.
+#   --preflight       : prove the credentials can write this env's R2 bucket AND its Bunny
+#                       installer zone (put + delete one tiny object in each) and exit; no
+#                       build. The release jobs run this first.
 #   --check-installer : check whether this env's installer host already serves an installer
 #                       that embeds this env's signing key (gates STUB_INSTALLER); no build, no key.
 #

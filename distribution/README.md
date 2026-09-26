@@ -14,8 +14,8 @@ Version-controlled source for the Monitorable agent distribution served at the
 - `install.sh` — Linux installer template with three placeholders: `@@BASE_URL@@` (the
   env's download host), `@@SIGNING_PUBKEY@@` (the env's release-signing public key, one
   line of base64 DER) and `@@MIN_VERSION@@` (the oldest release it accepts as `latest`).
-  The backend fills the first two when it serves the script and the third when it vendors
-  it; for the transitional copy on R2, `scripts/publish-dist.sh` fills all three
+  `scripts/publish-dist.sh` fills all three when it renders the installer for the
+  installer host (Bunny), and the same way for R2's transitional copy
   (`MIN_VERSION` = the release being published). A copy with any placeholder left refuses
   to run. The API key comes from
   `MONITORABLE_API_KEY` in the environment (preferred — an argv value is world-readable in
@@ -108,14 +108,16 @@ Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the p
 ## Publishing
 
 ```bash
-scripts/publish-dist.sh staging --preflight      # prove the credentials can write the bucket (put+delete one object)
-scripts/publish-dist.sh staging                  # build + render + upload to R2
+scripts/publish-dist.sh staging --preflight      # prove the credentials can write the R2 bucket AND the Bunny zone (put+delete one object in each)
+scripts/publish-dist.sh staging                  # build + render + upload to R2, then the installer to the Bunny installer host
 scripts/publish-dist.sh staging --render-only    # build + render into ./distribution-build, no upload
-scripts/publish-dist.sh staging --check-installer  # does the backend serve an installer with this env's key? (gates STUB_INSTALLER=1)
+scripts/publish-dist.sh staging --check-installer  # does this env's installer host serve an installer with this env's key? (gates STUB_INSTALLER=1)
 ```
 
 A build needs `VERSION=vX.Y.Z` (the release job passes the pushed tag; anything else is
-refused before signing) and `RELEASE_SIGNING_KEY`, which must match `distribution/keys/<env>.pub`.
+refused before signing) and `RELEASE_SIGNING_KEY`, which must match
+`distribution/keys/<env>.pub`. A publish or `--preflight` also needs
+`BUNNY_STORAGE_PASSWORD` (not `--render-only`, which never uploads).
 
 Uploads go over R2's **S3 API** with the AWS CLI (preinstalled on GitHub runners). The
 credentials are `CLOUDFLARE_R2_TOKEN` — an R2 API token with **Object Read & Write**

@@ -54,10 +54,10 @@ CONFIG_DIR="/etc/monitorable"
 BINARY_NAME="monitorable-agent"
 SERVICE_NAME="monitorable-agent"
 BASE_URL="@@BASE_URL@@"
-# Filled when this script is served (distribution/README.md "Integrity"): BASE_URL and
-# SIGNING_PUBKEY by the backend at serve time, MIN_VERSION when the backend vendors this
-# file (publish-dist.sh fills all three for the transitional copy on R2). SIGNING_PUBKEY
-# is one line: the base64 DER SubjectPublicKeyInfo of the release-signing ECDSA P-256 key.
+# Filled by publish-dist.sh (distribution/README.md "Integrity") when it renders this
+# script for the installer host, and the same way for the transitional copy on R2.
+# SIGNING_PUBKEY is one line: the base64 DER SubjectPublicKeyInfo of the release-signing
+# ECDSA P-256 key.
 SIGNING_PUBKEY="@@SIGNING_PUBKEY@@"
 MIN_VERSION="@@MIN_VERSION@@"
 VERSION="latest"
@@ -452,8 +452,9 @@ if ! fetch "$SIG_URL" "$TMP_SIG"; then
     exit 1
 fi
 # SHA256SUMS is trusted only once its signature verifies against the key embedded in this
-# script — served by the backend, never from the download host, so writing the download
-# bucket is not enough to forge it. openssl wants PEM with lines of at most 64 characters.
+# script — served by the installer host, never from the download host, so writing the
+# download bucket is not enough to forge it. openssl wants PEM with lines of at most 64
+# characters.
 {
     printf '%s\n' '-----BEGIN PUBLIC KEY-----'
     printf '%s\n' "$SIGNING_PUBKEY" | fold -w 64
