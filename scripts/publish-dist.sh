@@ -102,6 +102,8 @@ bunny_require_password() {
 }
 # bunny_curl <curl args...>: the header line must stay exactly `bunny_curl() {`, because
 # validate.yml extracts the function by that line to test that the password never reaches argv.
+# Never add -L here: curl forwards the AccessKey config across a redirect to another host.
+# Never add -v/--trace either: both print the header line, AccessKey included, to output.
 bunny_curl() {
   printf 'header = "AccessKey: %s"\n' "$BUNNY_STORAGE_PASSWORD" \
     | curl --proto '=https' --tlsv1.2 -fsS -K - "$@"
@@ -139,6 +141,10 @@ bunny_put() { # localpath name
 
 if [ "$MODE" = "--preflight" ]; then
   bunny_require_password
+  # As with RELEASE_SIGNING_KEY below: unexport once validated, so go build, aws, openssl,
+  # python3 and curl never inherit it through the environment. bunny_curl still reads it —
+  # it runs as a function in this shell, not a child process.
+  export -n BUNNY_STORAGE_PASSWORD
   r2_auth
   printf 'preflight %s %s\n' "$ENV" "$(date -u +%FT%TZ)" > "${TMPDIR:-/tmp}/r2-preflight.txt"
   if ! s3 s3 cp "${TMPDIR:-/tmp}/r2-preflight.txt" "s3://${BUCKET}/.preflight" --content-type text/plain --no-progress; then
@@ -237,7 +243,13 @@ if [ "$(openssl pkey -in "$SIGNING_KEY_FILE" -pubout 2>/dev/null | pem_body)" !=
   echo "ERROR: RELEASE_SIGNING_KEY does not match $EXPECTED_PUBKEY_FILE — refusing to sign" >&2; exit 1
 fi
 # A publish needs the Bunny password too; find out now, not after the R2 upload.
-if [ "$MODE" != "--render-only" ]; then bunny_require_password; fi
+if [ "$MODE" != "--render-only" ]; then
+  bunny_require_password
+  # As with RELEASE_SIGNING_KEY above: unexport once validated, so go build, aws, openssl,
+  # python3 and curl never inherit it through the environment. bunny_curl still reads it —
+  # it runs as a function in this shell, not a child process.
+  export -n BUNNY_STORAGE_PASSWORD
+fi
 
 rm -rf "$OUT"
 mkdir -p "$OUT/configs" "$BINOUT"
@@ -371,7 +383,7 @@ put "$OUT/latest.json" "latest.json" "application/json"
 # a re-run finishes it.
 bunny_put "$OUT/installer/install.sh" "install.sh"
 
-echo "published ${ENV} distribution to ${BUCKET}"
+echo "published ${ENV} distribution to ${BUCKET} and installer to Bunny zone ${BUNNY_STORAGE_ZONE}"
 
 # 4c. Verify the SERVED surface against what was just built: every object install.sh
 # downloads (versioned + latest/ binaries, configs, both SHA256SUMS), plus install.sh and
