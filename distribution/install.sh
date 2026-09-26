@@ -460,6 +460,26 @@ if ! openssl dgst -sha256 -verify "$TMP_PUB" -signature "$TMP_SIG" "$TMP_SUMS" >
     exit 1
 fi
 
+# version_ge A B: true when release A >= release B. Both must be vMAJOR.MINOR.PATCH with
+# numeric parts; anything else is false, so a malformed version fails closed. Compared
+# per component as integers: v1.10.0 is newer than v1.9.0.
+version_ge() {
+    for _v in "$1" "$2"; do
+        case "$_v" in v?*) ;; *) return 1 ;; esac
+        case "${_v#v}" in
+            *[!0-9.]*|*.*.*.*|*..*|.*|*.) return 1 ;;
+            *.*.*) ;;
+            *) return 1 ;;
+        esac
+    done
+    _a="${1#v}"; _b="${2#v}"
+    _a1="${_a%%.*}"; _a="${_a#*.}"; _a2="${_a%%.*}"; _a3="${_a#*.}"
+    _b1="${_b%%.*}"; _b="${_b#*.}"; _b2="${_b%%.*}"; _b3="${_b#*.}"
+    if [ "$_a1" -ne "$_b1" ]; then [ "$_a1" -gt "$_b1" ]; return; fi
+    if [ "$_a2" -ne "$_b2" ]; then [ "$_a2" -gt "$_b2" ]; return; fi
+    [ "$_a3" -ge "$_b3" ]
+}
+
 # verify <downloaded path> <name as listed in SHA256SUMS>. Exact field match via awk, so a
 # name that is a suffix of another cannot be confused; a missing entry leaves EXPECTED
 # empty and fails closed. The config and the unit are UNVERSIONED objects while SHA256SUMS
@@ -476,6 +496,27 @@ verify() {
         exit 1
     fi
 }
+
+# The version is inside the signed file, so an old, validly signed release can't be
+# replayed as "latest", and a pin gets exactly what it asked for.
+refuse_version() {
+    cleanup_tmp
+    printf '%b' "${RED}❌ ${NC}"
+    printf '%s\n' "$1"
+    printf '%b' "${RED}   Nothing was installed; any existing agent is untouched.${NC}\n"
+    exit 1
+}
+if [ "$(grep -c '^# version ' "$TMP_SUMS")" -ne 1 ]; then
+    refuse_version "SHA256SUMS must carry exactly one version line"
+fi
+SIGNED_VERSION="$(sed -n 's/^# version //p' "$TMP_SUMS")"
+if [ "$VERSION" = "latest" ]; then
+    version_ge "$SIGNED_VERSION" "$MIN_VERSION" ||
+        refuse_version "refusing $SIGNED_VERSION: older than this installer's minimum $MIN_VERSION"
+elif [ "$SIGNED_VERSION" != "$VERSION" ]; then
+    refuse_version "refusing $SIGNED_VERSION: not the requested $VERSION"
+fi
+
 verify "$TMP_BIN" "$BINARY_FILE"
 BIN_SHA256="$_actual"
 verify "$TMP_CONFIG" "$CONFIG_FILE"
@@ -484,7 +525,7 @@ rm -f "$TMP_SUMS" "$TMP_SIG" "$TMP_PUB"
 printf '%b' "${GREEN}✅ Binary, config and unit template verified against SHA256SUMS${NC}\n"
 # Named so the output records which bytes this host got; each release's SHA256SUMS is also
 # attached to its GitHub release, an origin independent of this download host.
-printf '   %s sha256 %s\n' "$BINARY_FILE" "$BIN_SHA256"
+printf '   %s %s sha256 %s\n' "$BINARY_FILE" "$SIGNED_VERSION" "$BIN_SHA256"
 
 # Create user and group — only now that everything downloaded has verified.
 printf '%b' "${YELLOW}👤 Creating user and group...${NC}\n"

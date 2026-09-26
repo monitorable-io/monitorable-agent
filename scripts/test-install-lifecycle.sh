@@ -94,6 +94,51 @@ rc=$(run_rc "unshare -m sh -c 'mount --bind /dev/null \"\$(command -v openssl)\"
 check no-openssl-refused '[ "$rc" = 1 ] && out_has "openssl is required" && ! run "test -e /opt/monitorable || getent passwd monitorable"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
+# Replay: validly signed sums for a release below the installer's floor are refused.
+run "sh /root/mirror-build.sh old v1.2.9 ok ok"
+render "$ORIGIN/old" /root/install-old.sh
+rc=$(run_rc "sh /root/install-old.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check replay-below-floor-refused '[ "$rc" = 1 ] && out_has "older than this installer" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# Numeric, not lexical: v1.10.0 clears a v1.9.0 floor.
+run "sh /root/mirror-build.sh numeric v1.10.0 ok ok"
+render "$ORIGIN/numeric" /root/install-numeric.sh v1.9.0
+rc=$(run_rc "sh /root/install-numeric.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check floor-compares-numerically '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# Pin: --version=vX installs only sums signed as vX.
+run "sh /root/mirror-build.sh pinned v1.3.0 ok ok v1.3.1 && sh /root/mirror-build.sh pinned v1.3.0 ok ok v1.3.0"
+render "$ORIGIN/pinned" /root/install-pinned.sh
+rc=$(run_rc "sh /root/install-pinned.sh --version=v1.3.1 --endpoint=$ENDPOINT --api-key=$KEY")
+check pinned-version-mismatch-refused '[ "$rc" = 1 ] && out_has "not the requested v1.3.1" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+rc=$(run_rc "sh /root/install-pinned.sh --version=v1.3.0 --endpoint=$ENDPOINT --api-key=$KEY")
+check pinned-version-match-installs '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A path-shaped --version resolves to latest/ on the server; the pin still refuses it.
+# curl and the mirror's http.server both normalize "otel/../latest" down to "latest"
+# (RFC 3986 dot-segment removal), so the request actually lands one level up from the
+# usual otel/<version>/ layout; stage the same genuine, correctly signed v1.3.0 bundle
+# there so the download succeeds and the pin check is what refuses it.
+run "sh /root/mirror-build.sh good $MIN ok ok ../latest"
+rc=$(run_rc "sh /root/install.sh --version=../latest --endpoint=$ENDPOINT --api-key=$KEY")
+check dotdot-version-refused '[ "$rc" = 1 ] && out_has "not the requested ../latest" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# Signed sums without exactly one version line fail closed.
+run "sh /root/mirror-build.sh noversion - ok ok && sh /root/mirror-build.sh dupversion dup ok ok"
+render "$ORIGIN/noversion" /root/install-noversion.sh
+render "$ORIGIN/dupversion" /root/install-dupversion.sh
+rc=$(run_rc "sh /root/install-noversion.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check missing-version-line-refused '[ "$rc" = 1 ] && out_has "exactly one version line" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+rc=$(run_rc "sh /root/install-dupversion.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check duplicate-version-line-refused '[ "$rc" = 1 ] && out_has "exactly one version line" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
 # fresh install with a key
 rc=$(run_rc "sh /root/install.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check fresh-install '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
