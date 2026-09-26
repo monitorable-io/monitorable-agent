@@ -75,7 +75,10 @@ jobs:
         # The tag goes through the environment, not through ${{ }} interpolation into the
         # shell: a git refname may contain $ ( ) " ` and ; , which would otherwise execute
         # in a job that holds contents:write and the staging environment's R2 token.
-        run: gh release create "$TAG" --generate-notes
+        # SHA256SUMS rides along as an asset: an origin independent of the R2 bucket to
+        # compare the digest install.sh prints against. Builds are reproducible (v1.2.2's
+        # staging and prod sums are byte-identical), so it holds for prod's rebuild too.
+        run: gh release create "$TAG" --generate-notes distribution-build/binaries/otel/SHA256SUMS
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}

@@ -326,8 +326,116 @@ if ! command -v sha256sum >/dev/null 2>&1; then
     printf '%b' "${RED}sha256sum (coreutils) is required but not installed.${NC}\n"
     exit 1
 fi
+# systemd is the only supported init: the agent's security model is its sandboxed unit.
+# Checked before ANY side effect, so an OpenRC host or a container without systemd gets a
+# clear refusal instead of a half-install that already holds the API key.
+if [ ! -d /run/systemd/system ] || ! command -v systemctl >/dev/null 2>&1; then
+    printf '%b' "${RED}This installer requires systemd, which is not running on this host.${NC}\n"
+    exit 1
+fi
 
-# Create user and group
+# Create installation and configuration directories. Only these two, before the download:
+# the downloads are staged in them. The service user comes after verification, so a failed
+# fresh install leaves no account (and no docker-group membership) behind.
+printf '%b' "${YELLOW}📁 Creating directories...${NC}\n"
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
+
+# Set up directories and permissions
+printf '%b' "${YELLOW}🔒 Setting up permissions...${NC}\n"
+
+# Set ownership and permissions. $INSTALL_DIR is asserted explicitly, not left to the
+# ambient umask: a pre-existing /opt/monitorable from an unrelated install could be owned
+# by or writable to a non-root user, who would then control the binary that root's
+# `systemctl restart` executes.
+INSTALL_DIR_OWNER="$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null || echo root)"
+if [ "$INSTALL_DIR_OWNER" != "root" ]; then
+    printf '%b' "${YELLOW}   $INSTALL_DIR was owned by ${NC}"
+    printf '%s' "$INSTALL_DIR_OWNER"
+    printf '%b' "${YELLOW} — re-owning it to root:root 755${NC}\n"
+fi
+chown root:root "$INSTALL_DIR"
+chmod 755 "$INSTALL_DIR"
+chown root:root "$CONFIG_DIR"
+chmod 755 "$CONFIG_DIR"
+
+# --- Download everything first, verify everything, install nothing yet -------------------
+# All three files this installer puts on disk (binary, collector config, unit template) are
+# listed in the ONE SHA256SUMS published next to the binaries, and all three are verified
+# before anything is installed. The unit template especially: it is sed-rendered into
+# /etc/systemd/system and daemon-reloaded, so an unverified one is an arbitrary ExecStart.
+# Downloads land on .tmp paths under $INSTALL_DIR (root-owned; never /tmp, where a
+# root-written file is a symlink-attack target) and are moved into place only at the end,
+# so a failed download or a checksum mismatch leaves the previous install intact and
+# running rather than taking the host down to no agent at all.
+# What SHA256SUMS does NOT protect: it is fetched from the same bucket over the same TLS
+# channel and is unsigned — see distribution/README.md.
+printf '%b' "${YELLOW}📦 Downloading the Monitorable agent...${NC}\n"
+TMP_BIN="$INSTALL_DIR/$BINARY_FILE.tmp"
+TMP_SUMS="$INSTALL_DIR/SHA256SUMS.tmp"
+TMP_UNIT="$INSTALL_DIR/$UNIT_FILE.tmp"
+TMP_UNIT_SUBST="$INSTALL_DIR/$UNIT_FILE.subst.tmp"
+# Staged on the SAME filesystem as their destination so the final `mv` is a rename and
+# therefore atomic. Across a mount boundary — /opt is very often a separate one — mv
+# degrades to create + copy, which is exactly the truncate-the-live-file failure mode the
+# staging exists to prevent. Both directories are root-owned, so this is as safe as /opt;
+# the unit is staged under a dot-name because systemd only reads *.service.
+TMP_CONFIG="$CONFIG_DIR/$CONFIG_FILE.tmp"
+TMP_UNIT_RENDERED="/etc/systemd/system/.$UNIT_FILE.tmp"
+
+cleanup_tmp() {
+    rm -f "$TMP_BIN" "$TMP_SUMS" "$TMP_CONFIG" "$TMP_UNIT" "$TMP_UNIT_SUBST" "$TMP_UNIT_RENDERED"
+}
+# Runs cleanup_tmp on any exit (error or otherwise) between now and the last install
+# `mv` below, so an abort anywhere in the download/verify/install sequence (a failed
+# download, a checksum mismatch, an interrupted script) leaves no `.tmp` files behind.
+# Cleared once the installs land, below.
+trap cleanup_tmp EXIT
+
+# fetch <url> <dest>. An https origin stays https for the whole transfer: --proto also
+# binds redirect targets, so a redirect cannot downgrade a download to cleartext, and TLS
+# below 1.2 is refused. The dev origin (http://get.monitorable.lan) keeps plain curl.
+fetch() {
+    case "$BASE_URL" in
+        https://*) curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2" ;;
+        *) curl -fsSL "$1" -o "$2" ;;
+    esac
+}
+if ! fetch "$COLLECTOR_URL" "$TMP_BIN" ||
+   ! fetch "$SUMS_URL" "$TMP_SUMS" ||
+   ! fetch "$CONFIG_URL" "$TMP_CONFIG" ||
+   ! fetch "$SERVICE_FILE_URL" "$TMP_UNIT"; then
+    cleanup_tmp
+    printf '%b' "${RED}❌ Failed to download the Monitorable agent distribution${NC}\n"
+    exit 1
+fi
+
+# verify <downloaded path> <name as listed in SHA256SUMS>. Exact field match via awk, so a
+# name that is a suffix of another cannot be confused; a missing entry leaves EXPECTED
+# empty and fails closed. The config and the unit are UNVERSIONED objects while SHA256SUMS
+# is published per version, so an older --version= whose sums predate the current config
+# fails here instead of installing a mismatched pair.
+verify() {
+    _expected="$(awk -v n="$2" '$2 == n { print $1 }' "$TMP_SUMS")"
+    _actual="$(sha256sum "$1" | cut -d' ' -f1)"
+    if [ -z "$_expected" ] || [ "$_expected" != "$_actual" ]; then
+        cleanup_tmp
+        printf '%b' "${RED}❌ Checksum mismatch or missing SHA256SUMS entry for:${NC} "
+        printf '%s\n' "$2"
+        printf '%b' "${RED}   Nothing was installed; any existing agent is untouched.${NC}\n"
+        exit 1
+    fi
+}
+verify "$TMP_BIN" "$BINARY_FILE"
+BIN_SHA256="$_actual"
+verify "$TMP_CONFIG" "$CONFIG_FILE"
+verify "$TMP_UNIT" "$UNIT_FILE"
+rm -f "$TMP_SUMS"
+printf '%b' "${GREEN}✅ Binary, config and unit template verified against SHA256SUMS${NC}\n"
+# Named so the output records which bytes this host got; each release's SHA256SUMS is also
+# attached to its GitHub release, an origin independent of this download host.
+printf '   %s sha256 %s\n' "$BINARY_FILE" "$BIN_SHA256"
+
+# Create user and group — only now that everything downloaded has verified.
 printf '%b' "${YELLOW}👤 Creating user and group...${NC}\n"
 
 # Create group if it doesn't exist
@@ -357,92 +465,9 @@ elif getent group docker | cut -d: -f4 | tr ',' '\n' | grep -qx "$SVC_USER"; the
     gpasswd -d "$SVC_USER" docker >/dev/null
 fi
 
-# Create installation and configuration directories
-printf '%b' "${YELLOW}📁 Creating directories...${NC}\n"
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" /var/lib/monitorable
-
-# Set up directories and permissions
-printf '%b' "${YELLOW}🔒 Setting up permissions...${NC}\n"
-
-# Set ownership and permissions. $INSTALL_DIR is asserted explicitly, not left to the
-# ambient umask: a pre-existing /opt/monitorable from an unrelated install could be owned
-# by or writable to a non-root user, who would then control the binary that root's
-# `systemctl restart` executes.
-INSTALL_DIR_OWNER="$(stat -c '%U' "$INSTALL_DIR" 2>/dev/null || echo root)"
-if [ "$INSTALL_DIR_OWNER" != "root" ]; then
-    printf '%b' "${YELLOW}   $INSTALL_DIR was owned by ${NC}"
-    printf '%s' "$INSTALL_DIR_OWNER"
-    printf '%b' "${YELLOW} — re-owning it to root:root 755${NC}\n"
-fi
-chown root:root "$INSTALL_DIR"
-chmod 755 "$INSTALL_DIR"
+mkdir -p /var/lib/monitorable
 chown "$SVC_USER:$SVC_GROUP" /var/lib/monitorable
 chmod 755 /var/lib/monitorable
-chown root:root "$CONFIG_DIR"
-chmod 755 "$CONFIG_DIR"
-
-# --- Download everything first, verify everything, install nothing yet -------------------
-# All three files this installer puts on disk (binary, collector config, unit template) are
-# listed in the ONE SHA256SUMS published next to the binaries, and all three are verified
-# before anything is installed. The unit template especially: it is sed-rendered into
-# /etc/systemd/system and daemon-reloaded, so an unverified one is an arbitrary ExecStart.
-# Downloads land on .tmp paths under $INSTALL_DIR (root-owned; never /tmp, where a
-# root-written file is a symlink-attack target) and are moved into place only at the end,
-# so a failed download or a checksum mismatch leaves the previous install intact and
-# running rather than taking the host down to no agent at all.
-# What SHA256SUMS does NOT protect: it is fetched from the same bucket over the same TLS
-# channel and is unsigned — see distribution/README.md.
-printf '%b' "${YELLOW}📦 Downloading the Monitorable agent...${NC}\n"
-TMP_BIN="$INSTALL_DIR/$BINARY_FILE.tmp"
-TMP_SUMS="$INSTALL_DIR/SHA256SUMS.tmp"
-TMP_UNIT="$INSTALL_DIR/$UNIT_FILE.tmp"
-# Staged on the SAME filesystem as their destination so the final `mv` is a rename and
-# therefore atomic. Across a mount boundary — /opt is very often a separate one — mv
-# degrades to create + copy, which is exactly the truncate-the-live-file failure mode the
-# staging exists to prevent. Both directories are root-owned, so this is as safe as /opt;
-# the unit is staged under a dot-name because systemd only reads *.service.
-TMP_CONFIG="$CONFIG_DIR/$CONFIG_FILE.tmp"
-TMP_UNIT_RENDERED="/etc/systemd/system/.$UNIT_FILE.tmp"
-
-cleanup_tmp() {
-    rm -f "$TMP_BIN" "$TMP_SUMS" "$TMP_CONFIG" "$TMP_UNIT" "$TMP_UNIT_RENDERED"
-}
-# Runs cleanup_tmp on any exit (error or otherwise) between now and the last install
-# `mv` below, so an abort anywhere in the download/verify/install sequence (a failed
-# download, a checksum mismatch, an interrupted script) leaves no `.tmp` files behind.
-# Cleared once the installs land, below.
-trap cleanup_tmp EXIT
-
-if ! curl -fsSL "$COLLECTOR_URL" -o "$TMP_BIN" ||
-   ! curl -fsSL "$SUMS_URL" -o "$TMP_SUMS" ||
-   ! curl -fsSL "$CONFIG_URL" -o "$TMP_CONFIG" ||
-   ! curl -fsSL "$SERVICE_FILE_URL" -o "$TMP_UNIT"; then
-    cleanup_tmp
-    printf '%b' "${RED}❌ Failed to download the Monitorable agent distribution${NC}\n"
-    exit 1
-fi
-
-# verify <downloaded path> <name as listed in SHA256SUMS>. Exact field match via awk, so a
-# name that is a suffix of another cannot be confused; a missing entry leaves EXPECTED
-# empty and fails closed. The config and the unit are UNVERSIONED objects while SHA256SUMS
-# is published per version, so an older --version= whose sums predate the current config
-# fails here instead of installing a mismatched pair.
-verify() {
-    _expected="$(awk -v n="$2" '$2 == n { print $1 }' "$TMP_SUMS")"
-    _actual="$(sha256sum "$1" | cut -d' ' -f1)"
-    if [ -z "$_expected" ] || [ "$_expected" != "$_actual" ]; then
-        cleanup_tmp
-        printf '%b' "${RED}❌ Checksum mismatch or missing SHA256SUMS entry for:${NC} "
-        printf '%s\n' "$2"
-        printf '%b' "${RED}   Nothing was installed; any existing agent is untouched.${NC}\n"
-        exit 1
-    fi
-}
-verify "$TMP_BIN" "$BINARY_FILE"
-verify "$TMP_CONFIG" "$CONFIG_FILE"
-verify "$TMP_UNIT" "$UNIT_FILE"
-rm -f "$TMP_SUMS"
-printf '%b' "${GREEN}✅ Binary, config and unit template verified against SHA256SUMS${NC}\n"
 
 # SMART disk-health capabilities, tiered by detected hardware. NVMe needs CAP_SYS_ADMIN for
 # the admin-passthrough ioctl; its controller char node /dev/nvmeX is 0600 root:root, so
@@ -520,18 +545,20 @@ printf '%b' "${YELLOW}🔧 Setting up systemd service...${NC}\n"
 # so sed handles them; the device placeholder expands to ZERO OR MORE lines, which a POSIX
 # sed substitution cannot do, so awk emits one `DeviceAllow=<class> r` line per detected
 # class — and drops the placeholder line entirely when none was detected. Rendered to a
-# temp file first and renamed, so a failed render cannot truncate a live unit file.
+# temp file first and renamed, so a failed render cannot truncate a live unit file. Two
+# steps through a file, not a pipe: POSIX sh has no pipefail, so a failing sed on the left
+# of a pipe would be masked by awk's exit status and escape set -e.
 sed -e "s|__MONITORABLE_SMART_CAPS__|$SMART_CAPS|g" \
     -e "s|__MONITORABLE_SMART_GROUPS__|$SMART_GROUPS|g" \
-    "$TMP_UNIT" \
-    | awk -v classes="$SMART_DEVICE_CLASSES" '
-        /__MONITORABLE_SMART_DEVICES__/ {
-            n = split(classes, c, " ")
-            for (i = 1; i <= n; i++) print "DeviceAllow=" c[i] " r"
-            next
-        }
-        { print }
-      ' > "$TMP_UNIT_RENDERED"
+    "$TMP_UNIT" > "$TMP_UNIT_SUBST"
+awk -v classes="$SMART_DEVICE_CLASSES" '
+    /__MONITORABLE_SMART_DEVICES__/ {
+        n = split(classes, c, " ")
+        for (i = 1; i <= n; i++) print "DeviceAllow=" c[i] " r"
+        next
+    }
+    { print }
+  ' "$TMP_UNIT_SUBST" > "$TMP_UNIT_RENDERED"
 chown root:root "$TMP_UNIT_RENDERED"
 chmod 644 "$TMP_UNIT_RENDERED"
 mv -f "$TMP_UNIT_RENDERED" "/etc/systemd/system/$UNIT_FILE"
@@ -539,7 +566,7 @@ mv -f "$TMP_UNIT_RENDERED" "/etc/systemd/system/$UNIT_FILE"
 # unrelated failure (e.g. the service-start check below) doesn't re-run cleanup_tmp
 # against paths that are already gone.
 trap - EXIT
-rm -f "$TMP_UNIT"
+rm -f "$TMP_UNIT" "$TMP_UNIT_SUBST"
 
 # Migrate an install made under the previous names (binary monitorable-otelcol, unit
 # monitorable-collector). Removed only here — after the new binary is on disk and
@@ -568,8 +595,8 @@ systemctl restart "$SERVICE_NAME"
 
 # Verify the collector actually STAYS up. With Type=simple, systemd reports
 # "active" the instant ExecStart forks — before the process can fail (bad config,
-# missing capability, a port already in use) — so an immediate is-active check is
-# unreliable. Wait for the unit to settle, then treat a non-active state OR any
+# missing capability) — so an immediate is-active check is unreliable. Wait for
+# the unit to settle, then treat a non-active state OR any
 # auto-restart (NRestarts > 0, i.e. it already crashed once) as a failed install.
 sleep 4
 NRESTARTS="$(systemctl show -p NRestarts --value "$SERVICE_NAME" 2>/dev/null || echo 0)"
@@ -579,14 +606,6 @@ else
     printf '%b' "${RED}❌ The agent failed to start and is restarting in a loop.${NC}\n"
     printf '%b' "${YELLOW}Recent logs:${NC}\n"
     journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null || true
-    if journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | grep -q "address already in use"; then
-        printf '%b' "\n${YELLOW}A port the agent needs is already in use. Current listeners:${NC}\n"
-        if command -v ss >/dev/null 2>&1; then
-            ss -ltnp 2>/dev/null || true
-        elif command -v netstat >/dev/null 2>&1; then
-            netstat -ltnp 2>/dev/null || true
-        fi
-    fi
     printf '%b' "\n${YELLOW}Follow the logs with:${NC}\n"
     printf '%b' "   journalctl -u $SERVICE_NAME -f\n"
     exit 1
