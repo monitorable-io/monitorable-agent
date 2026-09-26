@@ -1,22 +1,21 @@
 #!/bin/sh
 
 # Monitorable agent installer
-# Usage (preferred — keeps the key out of argv and out of sudo's auth.log). Get a root
-# shell first, then export and pipe inside it — don't use sudo's -E flag: sudo-rs,
-# Ubuntu's default sudo since 25.10, doesn't implement -E at all, and some sudoers
-# policies refuse it even where it's implemented. A `VAR=x curl ... | sudo sh` prefix
-# doesn't work either; it would apply to curl, which is the left side of the pipe, and
-# never reach sudo.
+# Usage: run the install command your dashboard shows (Servers → Add server). It fetches
+# this script from the Monitorable installer host and passes --endpoint= and the key.
+# Preferred (keeps the key out of argv and out of sudo's auth.log). Get a root shell first,
+# then export and pipe inside it — don't use sudo's -E flag: sudo-rs, Ubuntu's default sudo
+# since 25.10, doesn't implement -E at all, and some sudoers policies refuse it even where
+# it's implemented. A `VAR=x curl ... | sudo sh` prefix doesn't work either; it would apply
+# to curl, the left side of the pipe, and never reach sudo.
 #   sudo -s
 #   export MONITORABLE_API_KEY=<key>
-#   curl -fsSL @@BASE_URL@@/install.sh | sh -s -- --endpoint=<url>
-# Fallback, when a root shell isn't available:
-#   curl -fsSL @@BASE_URL@@/install.sh | sudo sh -s -- --api-key=<key>
-# The fallback puts the key in the world-readable /proc/<pid>/cmdline for the whole run
-# and in sudo's auth.log — prefer the root-shell form wherever you can.
+#   curl --proto '=https' --tlsv1.2 -fsSL <installer URL>/install.sh | sh -s -- --endpoint=<url>
+# The fallback (--api-key=<key> on the command line) puts the key in the world-readable
+# /proc/<pid>/cmdline for the whole run and in sudo's auth.log.
 # Optional: --endpoint=https://ingest.monitorable.net (default), --version=vX.Y.Z
-# Update (key and endpoint from /etc/monitorable/agent.env): curl -fsSL @@BASE_URL@@/install.sh | sudo sh
-# Uninstall: curl -fsSL @@BASE_URL@@/install.sh | sudo sh -s -- --uninstall
+# Update (key and endpoint from /etc/monitorable/agent.env): the same pipe, no options.
+# Uninstall: the same pipe with --uninstall.
 
 set -e
 
@@ -55,6 +54,12 @@ CONFIG_DIR="/etc/monitorable"
 BINARY_NAME="monitorable-agent"
 SERVICE_NAME="monitorable-agent"
 BASE_URL="@@BASE_URL@@"
+# Filled when this script is served (distribution/README.md "Integrity"): BASE_URL and
+# SIGNING_PUBKEY by the backend at serve time, MIN_VERSION when the backend vendors this
+# file (publish-dist.sh fills all three for the transitional copy on R2). SIGNING_PUBKEY
+# is one line: the base64 DER SubjectPublicKeyInfo of the release-signing ECDSA P-256 key.
+SIGNING_PUBKEY="@@SIGNING_PUBKEY@@"
+MIN_VERSION="@@MIN_VERSION@@"
 VERSION="latest"
 # Not USER/GROUP: those are exported by sudo and reassigning them would change $USER for
 # the rest of this script and every child process.
@@ -102,6 +107,23 @@ if [ "$UNINSTALL" -eq 1 ] && [ "$OTHER_OPTS" -eq 1 ]; then
     printf '%b' "${RED}--uninstall takes no other options${NC}\n"
     exit 1
 fi
+
+# A served installer has all three values filled. A leftover placeholder means the server
+# that sent this script did not render it — refuse before touching anything. The marker
+# is spelled "@""@" so this file carries no literal one outside the three placeholders.
+_ph="@""@"
+case "$BASE_URL$SIGNING_PUBKEY$MIN_VERSION" in
+    *"$_ph"*)
+        printf '%b' "${RED}This installer was served unrendered. Use the install command from your dashboard.${NC}\n"
+        exit 1
+        ;;
+esac
+case "$SIGNING_PUBKEY" in
+    ''|*[!A-Za-z0-9+/=]*)
+        printf '%b' "${RED}This installer carries a malformed signing key.${NC}\n"
+        exit 1
+        ;;
+esac
 
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -307,6 +329,7 @@ UNIT_FILE="$SERVICE_NAME.service"
 
 COLLECTOR_URL="$BASE_URL/binaries/otel/$VERSION/$BINARY_FILE"
 SUMS_URL="$BASE_URL/binaries/otel/$VERSION/SHA256SUMS"
+SIG_URL="$BASE_URL/binaries/otel/$VERSION/SHA256SUMS.sig"
 CONFIG_URL="$BASE_URL/configs/linux/$CONFIG_FILE"
 SERVICE_FILE_URL="$BASE_URL/configs/linux/$UNIT_FILE"
 
@@ -324,6 +347,11 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 if ! command -v sha256sum >/dev/null 2>&1; then
     printf '%b' "${RED}sha256sum (coreutils) is required but not installed.${NC}\n"
+    exit 1
+fi
+if ! command -v openssl >/dev/null 2>&1; then
+    printf '%b' "${RED}openssl is required to verify the release signature but is not installed.${NC}\n"
+    printf '%b' "Install it (apt-get install -y openssl / dnf install -y openssl) and re-run.\n"
     exit 1
 fi
 # systemd is the only supported init: the agent's security model is its sandboxed unit.
@@ -367,11 +395,13 @@ chmod 755 "$CONFIG_DIR"
 # root-written file is a symlink-attack target) and are moved into place only at the end,
 # so a failed download or a checksum mismatch leaves the previous install intact and
 # running rather than taking the host down to no agent at all.
-# What SHA256SUMS does NOT protect: it is fetched from the same bucket over the same TLS
-# channel and is unsigned — see distribution/README.md.
+# SHA256SUMS itself is verified against the embedded signing key below, before any of its
+# entries are trusted — see distribution/README.md "Integrity".
 printf '%b' "${YELLOW}📦 Downloading the Monitorable agent...${NC}\n"
 TMP_BIN="$INSTALL_DIR/$BINARY_FILE.tmp"
 TMP_SUMS="$INSTALL_DIR/SHA256SUMS.tmp"
+TMP_SIG="$INSTALL_DIR/SHA256SUMS.sig.tmp"
+TMP_PUB="$INSTALL_DIR/signing.pub.tmp"
 TMP_UNIT="$INSTALL_DIR/$UNIT_FILE.tmp"
 TMP_UNIT_SUBST="$INSTALL_DIR/$UNIT_FILE.subst.tmp"
 # Staged on the SAME filesystem as their destination so the final `mv` is a rename and
@@ -383,7 +413,7 @@ TMP_CONFIG="$CONFIG_DIR/$CONFIG_FILE.tmp"
 TMP_UNIT_RENDERED="/etc/systemd/system/.$UNIT_FILE.tmp"
 
 cleanup_tmp() {
-    rm -f "$TMP_BIN" "$TMP_SUMS" "$TMP_CONFIG" "$TMP_UNIT" "$TMP_UNIT_SUBST" "$TMP_UNIT_RENDERED"
+    rm -f "$TMP_BIN" "$TMP_SUMS" "$TMP_SIG" "$TMP_PUB" "$TMP_CONFIG" "$TMP_UNIT" "$TMP_UNIT_SUBST" "$TMP_UNIT_RENDERED"
 }
 # Runs cleanup_tmp on any exit (error or otherwise) between now and the last install
 # `mv` below, so an abort anywhere in the download/verify/install sequence (a failed
@@ -409,6 +439,27 @@ if ! fetch "$COLLECTOR_URL" "$TMP_BIN" ||
     exit 1
 fi
 
+# The signature is fetched separately so its absence says so: a missing .sig is never
+# "unsigned mode" — every release since v1.3.0 carries one.
+if ! fetch "$SIG_URL" "$TMP_SIG"; then
+    cleanup_tmp
+    printf '%b' "${RED}❌ SHA256SUMS.sig is missing: this release is not signed. Nothing was installed.${NC}\n"
+    exit 1
+fi
+# SHA256SUMS is trusted only once its signature verifies against the key embedded in this
+# script — served by the backend, never from the download host, so writing the download
+# bucket is not enough to forge it. openssl wants PEM with lines of at most 64 characters.
+{
+    printf '%s\n' '-----BEGIN PUBLIC KEY-----'
+    printf '%s\n' "$SIGNING_PUBKEY" | fold -w 64
+    printf '%s\n' '-----END PUBLIC KEY-----'
+} > "$TMP_PUB"
+if ! openssl dgst -sha256 -verify "$TMP_PUB" -signature "$TMP_SIG" "$TMP_SUMS" >/dev/null 2>&1; then
+    cleanup_tmp
+    printf '%b' "${RED}❌ SHA256SUMS signature does NOT verify: nothing installed; any existing agent is untouched.${NC}\n"
+    exit 1
+fi
+
 # verify <downloaded path> <name as listed in SHA256SUMS>. Exact field match via awk, so a
 # name that is a suffix of another cannot be confused; a missing entry leaves EXPECTED
 # empty and fails closed. The config and the unit are UNVERSIONED objects while SHA256SUMS
@@ -429,7 +480,7 @@ verify "$TMP_BIN" "$BINARY_FILE"
 BIN_SHA256="$_actual"
 verify "$TMP_CONFIG" "$CONFIG_FILE"
 verify "$TMP_UNIT" "$UNIT_FILE"
-rm -f "$TMP_SUMS"
+rm -f "$TMP_SUMS" "$TMP_SIG" "$TMP_PUB"
 printf '%b' "${GREEN}✅ Binary, config and unit template verified against SHA256SUMS${NC}\n"
 # Named so the output records which bytes this host got; each release's SHA256SUMS is also
 # attached to its GitHub release, an origin independent of this download host.

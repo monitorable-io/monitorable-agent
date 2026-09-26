@@ -71,6 +71,29 @@ rc=$(run_rc "sh /root/install-tampered.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check tampered-leaves-no-user '[ "$rc" = 1 ] && out_has "Checksum mismatch" && ! run "getent passwd monitorable || getent group monitorable"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
+# Signature: a valid signature over OTHER bytes, or no .sig at all, installs nothing.
+run "sh /root/mirror-build.sh badsig $MIN ok bad && sh /root/mirror-build.sh nosig $MIN ok none"
+render "$ORIGIN/badsig" /root/install-badsig.sh
+render "$ORIGIN/nosig" /root/install-nosig.sh
+rc=$(run_rc "sh /root/install-badsig.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check bad-signature-refused '[ "$rc" = 1 ] && out_has "signature does NOT verify" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+rc=$(run_rc "sh /root/install-nosig.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check missing-signature-refused '[ "$rc" = 1 ] && out_has "SHA256SUMS.sig is missing" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A template served without its placeholders filled is refused before anything else.
+lxc exec "$CT" -- sh -c "cat > /root/install-unrendered.sh" < distribution/install.sh
+rc=$(run_rc "sh /root/install-unrendered.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check unrendered-template-refused '[ "$rc" = 1 ] && out_has "served unrendered" && ! run "test -e /opt/monitorable"'
+
+# No openssl: refused before any side effect. The binary is hidden for this one run by a
+# bind mount of /dev/null in a private mount namespace; the inner `! command -v` is the
+# precondition, so the case cannot pass without openssl actually being hidden.
+rc=$(run_rc "unshare -m sh -c 'mount --bind /dev/null \"\$(command -v openssl)\" && ! command -v openssl >/dev/null && exec sh /root/install.sh --endpoint=$ENDPOINT --api-key=$KEY'")
+check no-openssl-refused '[ "$rc" = 1 ] && out_has "openssl is required" && ! run "test -e /opt/monitorable || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
 # fresh install with a key
 rc=$(run_rc "sh /root/install.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check fresh-install '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
