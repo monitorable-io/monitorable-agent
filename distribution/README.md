@@ -15,9 +15,9 @@ Version-controlled source for the Monitorable agent distribution served at the
   env's download host), `@@SIGNING_PUBKEY@@` (the env's release-signing public key, one
   line of base64 DER) and `@@MIN_VERSION@@` (the oldest release it accepts as `latest`).
   `scripts/publish-dist.sh` fills all three when it renders the installer for the
-  installer host (Bunny), and the same way for R2's transitional copy
-  (`MIN_VERSION` = the release being published). A copy with any placeholder left refuses
-  to run. The API key comes from
+  installer host (Bunny). Since v1.3.2 R2's `install.sh` is the stub (`install-stub.sh`,
+  its own single `@@INSTALLER_URL@@` placeholder) instead of a second copy of this
+  template. A copy with any placeholder left refuses to run. The API key comes from
   `MONITORABLE_API_KEY` in the environment (preferred — an argv value is world-readable in
   `/proc/<pid>/cmdline` and is written to `auth.log` by sudo) or from `--api-key=`, which
   overrides it. The environment form is `sudo -s` to get a root shell, then `export
