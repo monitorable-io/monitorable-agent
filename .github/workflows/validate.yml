@@ -34,7 +34,44 @@ jobs:
             echo "shellcheck not found on runner" >&2
             exit 1
           fi
-          shellcheck distribution/install.sh scripts/publish-dist.sh
+          shellcheck distribution/install.sh distribution/install-stub.sh scripts/publish-dist.sh
+      - name: Signing dry-run (publish-dist.sh --render-only with a throwaway key)
+        run: |
+          set -eu
+          key="$RUNNER_TEMP/k.pem"; pub="$RUNNER_TEMP/k.pub"; other="$RUNNER_TEMP/other.pem"
+          openssl ecparam -name prime256v1 -genkey -noout -out "$key"
+          openssl pkey -in "$key" -pubout -out "$pub"
+          STUB_INSTALLER=0 RELEASE_SIGNING_KEY="$(cat "$key")" EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
+            scripts/publish-dist.sh staging --render-only
+          b=distribution-build/binaries/otel
+          openssl dgst -sha256 -verify "$pub" -signature "$b/SHA256SUMS.sig" "$b/SHA256SUMS"
+          head -n 1 "$b/SHA256SUMS" | grep -qx '# version v0.0.0'
+          test "$(grep -c '^# version ' "$b/SHA256SUMS")" -eq 1
+          ! grep -q '@@' distribution-build/install.sh
+          grep -qF "SIGNING_PUBKEY=\"$(grep -v -- '-----' "$pub" | tr -d '\n')\"" distribution-build/install.sh
+          grep -qx 'MIN_VERSION="v0.0.0"' distribution-build/install.sh
+          # A key that does not match the expected public key is refused before any build.
+          openssl ecparam -name prime256v1 -genkey -noout -out "$other"
+          if RELEASE_SIGNING_KEY="$(cat "$other")" EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
+               scripts/publish-dist.sh staging --render-only; then
+            echo "FAIL: a mismatched signing key was not refused"; exit 1
+          fi
+          # No key at all is refused.
+          if EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 scripts/publish-dist.sh staging --render-only; then
+            echo "FAIL: a missing signing key was not refused"; exit 1
+          fi
+          # Stub preflight: a URL that answers 200 with a DIFFERENT key (this commit's own
+          # template, whose key is the placeholder) must not get the stub.
+          if STUB_INSTALLER=1 INSTALLER_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/distribution" \
+               RELEASE_SIGNING_KEY="$(cat "$key")" EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
+               scripts/publish-dist.sh staging --render-only; then
+            echo "FAIL: the stub preflight accepted an installer URL serving another key"; exit 1
+          fi
+          # The same check on its own, without any private key.
+          if INSTALLER_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/distribution" \
+               EXPECTED_PUBKEY_FILE="$pub" scripts/publish-dist.sh staging --check-installer; then
+            echo "FAIL: --check-installer accepted an installer URL serving another key"; exit 1
+          fi
       - name: Cross-compile smoke (linux amd64+arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/agent-amd64 ./cmd/monitorable-agent
