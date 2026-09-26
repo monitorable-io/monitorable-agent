@@ -72,11 +72,17 @@ Around that check:
   failed fresh install leaves no account behind (only the empty `/opt/monitorable` and
   `/etc/monitorable` the downloads were staged in).
 
-What this protects: a truncated or corrupted transfer, and a CDN serving new checksums
-against stale payloads. What it does **not** protect: a compromise of the bucket or of the
-TLS channel — `SHA256SUMS` is unsigned and comes from the same origin as `install.sh`
-itself. The root of trust is the install command rendered in the dashboard. Signing the
-checksum file with a key held outside R2 is a planned follow-up.
+`SHA256SUMS` starts with one `# version vX.Y.Z` line and is signed (openssl ECDSA P-256,
+`SHA256SUMS.sig`) with a per-environment key that exists only in this repo's GitHub
+environments (and an offline backup). The public keys are committed at `distribution/keys/`.
+`install.sh` is **served by the Monitorable backend** (`https://get.monitorable.net/install.sh`,
+staging `https://install-mon.ok9k.com/install.sh`), which embeds the public key. The script
+verifies the signature, then requires the signed version to be ≥ its `MIN_VERSION` (or to
+equal `--version=`), then checks every file against the authenticated sums. Writing this
+download bucket is therefore not enough to get code onto a host: that needs the signing key
+too. Verify a release yourself:
+`openssl dgst -sha256 -verify distribution/keys/prod.pub -signature SHA256SUMS.sig SHA256SUMS`.
+Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the platform repo.
 
 ## Publishing
 

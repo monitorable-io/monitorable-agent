@@ -50,6 +50,7 @@ jobs:
     env:
       CLOUDFLARE_R2_TOKEN: ${{ secrets.CLOUDFLARE_R2_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,8 +78,10 @@ jobs:
         # in a job that holds contents:write and the staging environment's R2 token.
         # SHA256SUMS rides along as an asset: an origin independent of the R2 bucket to
         # compare the digest install.sh prints against. Builds are reproducible (v1.2.2's
-        # staging and prod sums are byte-identical), so it holds for prod's rebuild too.
-        run: gh release create "$TAG" --generate-notes distribution-build/binaries/otel/SHA256SUMS
+        # staging and prod sums are byte-identical), so it holds for prod's rebuild too
+        # …and SHA256SUMS.sig, signed with the staging key. Prod re-signs its own
+        # byte-identical sums with the prod key; verify those with distribution/keys/prod.pub.
+        run: gh release create "$TAG" --generate-notes distribution-build/binaries/otel/SHA256SUMS distribution-build/binaries/otel/SHA256SUMS.sig
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
@@ -94,6 +97,7 @@ jobs:
     env:
       CLOUDFLARE_R2_TOKEN: ${{ secrets.CLOUDFLARE_R2_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       VERSION: ${{ inputs.tag }}
     steps:
       - name: Refuse unless confirmed and the tag is well-formed
