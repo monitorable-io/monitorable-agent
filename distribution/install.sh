@@ -200,29 +200,44 @@ fi
 # Key-free re-run = update: take what was not given explicitly from the agent.env this
 # script wrote on the first install. Parsed, never sourced: the file is root-owned 0600,
 # but a sourced file executes, and the values still go through the same checks below.
-env_value() {
-    # $1 is one of two constant names, never user input.
-    sed -n "s/^$1=//p" "$AGENT_ENV" | head -n 1
+# A pre-v1.2.0 agent (monitorable-collector, v1.0.0–v1.1.23) has no agent.env: it kept
+# both values as Environment= lines in its unit. Reading them there is a one-time
+# migration — the install below writes agent.env and retires that unit.
+LEGACY_UNIT="/etc/systemd/system/monitorable-collector.service"
+file_value() {
+    # $1 is one of two constant paths, $2 a constant line prefix; never user input.
+    sed -n "s/^$2//p" "$1" | head -n 1
 }
-KEY_FROM_AGENT_ENV=0
+SOURCE_FILE=""
+SOURCE_PREFIX=""
 if [ -f "$AGENT_ENV" ]; then
+    SOURCE_FILE="$AGENT_ENV"
+elif [ -f "$LEGACY_UNIT" ]; then
+    SOURCE_FILE="$LEGACY_UNIT"
+    SOURCE_PREFIX="Environment="
+fi
+KEY_FROM_FILE=0
+if [ -n "$SOURCE_FILE" ]; then
     if [ -z "$API_KEY" ]; then
-        API_KEY="$(env_value MONITORABLE_API_KEY)"
-        [ -n "$API_KEY" ] && KEY_FROM_AGENT_ENV=1
+        API_KEY="$(file_value "$SOURCE_FILE" "${SOURCE_PREFIX}MONITORABLE_API_KEY=")"
+        [ -n "$API_KEY" ] && KEY_FROM_FILE=1
     fi
     if [ -z "$ENDPOINT" ]; then
-        ENDPOINT="$(env_value MONITORABLE_ENDPOINT)"
+        ENDPOINT="$(file_value "$SOURCE_FILE" "${SOURCE_PREFIX}MONITORABLE_ENDPOINT=")"
     fi
 fi
 [ -n "$ENDPOINT" ] || ENDPOINT="$DEFAULT_ENDPOINT"
 
 if [ -z "$API_KEY" ]; then
     printf '%b' "${RED}No agent is installed on this server. Add the server in the dashboard to get its install command.${NC}\n"
-    printf '%b' "If an older agent is installed, re-run its original install command once.\n"
     exit 1
 fi
-if [ "$KEY_FROM_AGENT_ENV" -eq 1 ]; then
-    printf '%b' "${BLUE}🔁 Updating the existing agent (API key and endpoint from $AGENT_ENV)${NC}\n"
+if [ "$KEY_FROM_FILE" -eq 1 ]; then
+    if [ "$SOURCE_FILE" = "$AGENT_ENV" ]; then
+        printf '%b' "${BLUE}🔁 Updating the existing agent (API key and endpoint from $AGENT_ENV)${NC}\n"
+    else
+        printf '%b' "${BLUE}🔁 Updating the existing agent (pre-v1.2.0: API key and endpoint from $LEGACY_UNIT; they move to $AGENT_ENV)${NC}\n"
+    fi
 fi
 
 # The key and the endpoint are written verbatim into agent.env, and systemd hands every

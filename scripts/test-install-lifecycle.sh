@@ -74,6 +74,22 @@ check uninstall-idempotent '[ "$rc" = 0 ] && out_has "Nothing to remove"'
 rc=$(run_rc "sh /root/install.sh")
 check keyfree-on-clean-host '[ "$rc" = 1 ] && out_has "No agent is installed on this server"'
 
+# key-free update of a pre-v1.2.0 host: v1.0.0–v1.1.23 kept the key and endpoint as
+# Environment= lines in the monitorable-collector unit and wrote no agent.env. A stand-in
+# unit in that exact shape (sleep instead of the old binary) is enough: the script only
+# reads the two lines, then installs and retires the old unit.
+run "printf '[Service]\nExecStart=/bin/sleep infinity\nEnvironment=MONITORABLE_API_KEY=%s\nEnvironment=MONITORABLE_ENDPOINT=%s\n[Install]\nWantedBy=multi-user.target\n' $KEY $ENDPOINT > /etc/systemd/system/monitorable-collector.service && systemctl daemon-reload && systemctl enable --now monitorable-collector >/dev/null 2>&1"
+rc=$(run_rc "sh /root/install.sh")
+check keyfree-legacy-unit '[ "$rc" = 0 ] && out_has "Updating the existing agent" && out_has "pre-v1.2.0" && run "grep -qx MONITORABLE_API_KEY=$KEY /etc/monitorable/agent.env && grep -qx MONITORABLE_ENDPOINT=$ENDPOINT /etc/monitorable/agent.env && systemctl is-active --quiet monitorable-agent && ! test -e /etc/systemd/system/monitorable-collector.service && ! systemctl is-active --quiet monitorable-collector"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# a pre-v1.2.0 unit without the key line is still "No agent is installed", never an
+# install with an empty key
+run "printf '[Service]\nExecStart=/bin/sleep infinity\nEnvironment=MONITORABLE_ENDPOINT=%s\n' $ENDPOINT > /etc/systemd/system/monitorable-collector.service"
+rc=$(run_rc "sh /root/install.sh")
+check legacy-unit-without-key '[ "$rc" = 1 ] && out_has "No agent is installed on this server"'
+run "rm -f /etc/systemd/system/monitorable-collector.service && systemctl daemon-reload"
+
 # --uninstall reports a failed delete instead of aborting outright under set -e.
 # chattr +i needs CAP_LINUX_IMMUTABLE, which this unprivileged LXD container's profile
 # denies (verified: chattr +i -> "Operation not permitted"), so the obstruction here is a
