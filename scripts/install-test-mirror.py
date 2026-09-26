@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Test-only download mirror for scripts/test-install-lifecycle.sh.
 
-Runs INSIDE the LXD test container, never on a real host. The harness fills both
-directories with byte-identical copies of the staging files and then tampers with one
-copy of the binary.
+Runs INSIDE the LXD test container, never on a real host. /root/mirrors/<name>/ trees are
+built by install-test-mirror-build.sh from the genuine staging files.
 
   https://127.0.0.1:8443/redir/<p> -> 302 to http://localhost:8080/<p> (cleartext)
-  https://127.0.0.1:8443/<p>       -> /root/mirror-bad/<p> (the binary is tampered)
-  http://127.0.0.1:8080/<p>        -> /root/mirror/<p>     (the genuine files)
+  https://127.0.0.1:8443/<p>       -> /root/mirrors/<p>
+  http://127.0.0.1:8080/<p>        -> /root/mirrors/<p>
 
-The certificate is self-signed for "localhost"; install.sh trusts it only through the
-CURL_CA_BUNDLE the harness sets on that one run.
+The certificate is self-signed for "localhost"; the harness exports CURL_CA_BUNDLE for it.
 """
 import functools
 import http.server
@@ -37,6 +35,6 @@ def serve(port, handler, tls):
     httpd.serve_forever()
 
 
-plain = functools.partial(http.server.SimpleHTTPRequestHandler, directory="/root/mirror")
+plain = functools.partial(http.server.SimpleHTTPRequestHandler, directory="/root/mirrors")
 threading.Thread(target=serve, args=(8080, plain, False), daemon=True).start()
-serve(8443, functools.partial(RedirectOrServe, directory="/root/mirror-bad"), True)
+serve(8443, functools.partial(RedirectOrServe, directory="/root/mirrors"), True)

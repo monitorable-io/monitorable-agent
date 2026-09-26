@@ -1,41 +1,55 @@
 #!/bin/sh
 # Lifecycle harness for distribution/install.sh. Dev host only (needs LXD).
 # Usage: scripts/test-install-lifecycle.sh <lxd-container>
-# The container must be a networked Ubuntu 24.04 that can reach get-mon.ok9k.com.
+# The container must be a networked Ubuntu 24.04 that can reach get-mon.ok9k.com (the
+# genuine files are copied from there once). Every install then runs against a local
+# https mirror (scripts/install-test-mirror.py) serving copies re-signed with a throwaway
+# key, so the harness can stage any signature, version or checksum failure.
 # shellcheck disable=SC2016,SC2034  # check() strings hold $vars for eval to expand later; rc feeds them the same way.
 set -eu
 CT="${1:?usage: $0 <lxd-container>}"
-BASE_URL="${BASE_URL:-https://get-mon.ok9k.com}"
+SRC_URL="${SRC_URL:-https://get-mon.ok9k.com}"
+ORIGIN="https://localhost:8443"
 KEY="$(printf '%064d' 0 | tr 0 a)"
 ENDPOINT="https://ingest-mon.ok9k.com"
+MIN="v1.3.0"
 FAILS=0
 
-# render [<base url> <path in container>]: install.sh with @@BASE_URL@@ baked, as publish does
-render() { sed "s|@@BASE_URL@@|${1:-$BASE_URL}|g" distribution/install.sh | lxc exec "$CT" -- sh -c "cat > ${2:-/root/install.sh}"; }
-run() { lxc exec "$CT" -- sh -c "$1"; }
+# Every harness command trusts the mirror's self-signed certificate (and only it).
+run() { lxc exec "$CT" --env CURL_CA_BUNDLE=/root/tls/cert.pem -- sh -c "$1"; }
 # run_rc <cmd>: prints combined output to /tmp/out in the container, returns the exit code
-run_rc() { lxc exec "$CT" -- sh -c "$1 > /tmp/out 2>&1; echo \$?" ; }
+run_rc() { lxc exec "$CT" --env CURL_CA_BUNDLE=/root/tls/cert.pem -- sh -c "$1 > /tmp/out 2>&1; echo \$?" ; }
+# raw: no CA override, for the one-time copy from the real staging origin
+raw() { lxc exec "$CT" -- sh -c "$1"; }
 out_has() { run "grep -qF -- '$1' /tmp/out"; }
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; run 'tail -n 20 /tmp/out' || true; FAILS=$((FAILS + 1)); }
 check() { if eval "$2"; then pass "$1"; else fail "$1"; fi; }
 
-render
-
-# Local download mirror (scripts/install-test-mirror.py) for the cases a real origin can't
-# stage: a tampered binary, and an https origin that redirects to cleartext. Filled with
-# the current staging files; stopped on exit however the harness ends.
-run "rm -rf /root/mirror /root/mirror-bad /root/tls && mkdir -p /root/tls /root/mirror/binaries/otel/latest /root/mirror/configs/linux"
-run "a=\$(dpkg --print-architecture) && cd /root/mirror && curl -fsS -o binaries/otel/latest/monitorable-agent-linux-\$a $BASE_URL/binaries/otel/latest/monitorable-agent-linux-\$a && curl -fsS -o binaries/otel/latest/SHA256SUMS $BASE_URL/binaries/otel/latest/SHA256SUMS && curl -fsS -o configs/linux/collector-config.yaml $BASE_URL/configs/linux/collector-config.yaml && curl -fsS -o configs/linux/monitorable-agent.service $BASE_URL/configs/linux/monitorable-agent.service"
-run "cp -r /root/mirror /root/mirror-bad && printf x >> /root/mirror-bad/binaries/otel/latest/monitorable-agent-linux-\$(dpkg --print-architecture)"
-run "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout /root/tls/key.pem -out /root/tls/cert.pem >/dev/null 2>&1"
+# Genuine files, TLS certificate and throwaway signing key.
+raw "rm -rf /root/mirrors /root/tls && mkdir -p /root/tls /root/mirrors/src/configs/linux"
+raw "a=\$(dpkg --print-architecture) && cd /root/mirrors/src && curl -fsS -o monitorable-agent-linux-\$a $SRC_URL/binaries/otel/latest/monitorable-agent-linux-\$a && curl -fsS -o SHA256SUMS $SRC_URL/binaries/otel/latest/SHA256SUMS && curl -fsS -o configs/linux/collector-config.yaml $SRC_URL/configs/linux/collector-config.yaml && curl -fsS -o configs/linux/monitorable-agent.service $SRC_URL/configs/linux/monitorable-agent.service"
+raw "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout /root/tls/key.pem -out /root/tls/cert.pem >/dev/null 2>&1"
+raw "openssl ecparam -name prime256v1 -genkey -noout -out /root/tls/sign.key"
+TEST_PUB="$(raw "openssl pkey -in /root/tls/sign.key -pubout" | grep -v -- '-----' | tr -d '\n')"
 lxc file push --quiet scripts/install-test-mirror.py "$CT/root/install-test-mirror.py"
+lxc file push --quiet scripts/install-test-mirror-build.sh "$CT/root/mirror-build.sh"
 trap 'lxc exec "$CT" -- systemctl stop install-test-mirror >/dev/null 2>&1 || true' EXIT
 run "systemctl stop install-test-mirror >/dev/null 2>&1; systemd-run --quiet --collect --unit=install-test-mirror python3 /root/install-test-mirror.py"
-run "for i in 1 2 3 4 5 6 7 8 9 10; do curl -fsS --cacert /root/tls/cert.pem -o /dev/null https://localhost:8443/configs/linux/collector-config.yaml && exit 0; sleep 1; done; exit 1"
-render https://localhost:8443 /root/install-tampered.sh
-render https://localhost:8443/redir /root/install-redirect.sh
-MIRROR_CA="CURL_CA_BUNDLE=/root/tls/cert.pem"
+
+# render <base url> <path in container> [<min version>]: fill the placeholders the way the
+# backend (BASE_URL, SIGNING_PUBKEY) and the vendoring step (MIN_VERSION) do.
+render() {
+    sed -e "s|@@BASE_URL@@|$1|g" -e "s|@@SIGNING_PUBKEY@@|$TEST_PUB|g" -e "s|@@MIN_VERSION@@|${3:-$MIN}|g" \
+        distribution/install.sh | lxc exec "$CT" -- sh -c "cat > $2"
+}
+
+run "sh /root/mirror-build.sh good $MIN ok ok"
+run "sh /root/mirror-build.sh tampered $MIN tampered ok"
+run "for i in 1 2 3 4 5 6 7 8 9 10; do curl -fsS -o /dev/null $ORIGIN/good/configs/linux/collector-config.yaml && exit 0; sleep 1; done; exit 1"
+render "$ORIGIN/good" /root/install.sh
+render "$ORIGIN/tampered" /root/install-tampered.sh
+render "$ORIGIN/redir/good" /root/install-redirect.sh
 
 # Every case up to fresh-install needs a host with no agent; assert it so none of them can
 # pass because of a leftover from an earlier run.
@@ -48,12 +62,12 @@ check no-systemd-refused '[ "$rc" = 1 ] && out_has "requires systemd" && ! run "
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # An https origin that redirects to http is refused: nothing downloads in cleartext.
-rc=$(run_rc "$MIRROR_CA sh /root/install-redirect.sh --endpoint=$ENDPOINT --api-key=$KEY")
+rc=$(run_rc "sh /root/install-redirect.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check https-redirect-to-http-refused '[ "$rc" = 1 ] && out_has "Failed to download" && ! run "test -e /opt/monitorable/monitorable-agent"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # A checksum mismatch on a fresh install leaves no service user or group behind.
-rc=$(run_rc "$MIRROR_CA sh /root/install-tampered.sh --endpoint=$ENDPOINT --api-key=$KEY")
+rc=$(run_rc "sh /root/install-tampered.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check tampered-leaves-no-user '[ "$rc" = 1 ] && out_has "Checksum mismatch" && ! run "getent passwd monitorable || getent group monitorable"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
