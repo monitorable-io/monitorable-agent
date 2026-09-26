@@ -31,6 +31,9 @@ raw "rm -rf /root/mirrors /root/tls && mkdir -p /root/tls /root/mirrors/src/conf
 raw "a=\$(dpkg --print-architecture) && cd /root/mirrors/src && curl -fsS -o monitorable-agent-linux-\$a $SRC_URL/binaries/otel/latest/monitorable-agent-linux-\$a && curl -fsS -o SHA256SUMS $SRC_URL/binaries/otel/latest/SHA256SUMS && curl -fsS -o configs/linux/collector-config.yaml $SRC_URL/configs/linux/collector-config.yaml && curl -fsS -o configs/linux/monitorable-agent.service $SRC_URL/configs/linux/monitorable-agent.service"
 raw "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout /root/tls/key.pem -out /root/tls/cert.pem >/dev/null 2>&1"
 raw "openssl ecparam -name prime256v1 -genkey -noout -out /root/tls/sign.key"
+# A second key the installer does not embed: signs the genuine sums for the "valid
+# signature, wrong key" case.
+raw "openssl ecparam -name prime256v1 -genkey -noout -out /root/tls/other.key"
 TEST_PUB="$(raw "openssl pkey -in /root/tls/sign.key -pubout" | grep -v -- '-----' | tr -d '\n')"
 lxc file push --quiet scripts/install-test-mirror.py "$CT/root/install-test-mirror.py"
 lxc file push --quiet scripts/install-test-mirror-build.sh "$CT/root/mirror-build.sh"
@@ -71,15 +74,34 @@ rc=$(run_rc "sh /root/install-tampered.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check tampered-leaves-no-user '[ "$rc" = 1 ] && out_has "Checksum mismatch" && ! run "getent passwd monitorable || getent group monitorable"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
-# Signature: a valid signature over OTHER bytes, or no .sig at all, installs nothing.
+# Signature: a valid signature over OTHER bytes, a valid signature over the genuine sums by
+# a DIFFERENT key, an empty .sig, or no .sig at all, installs nothing.
 run "sh /root/mirror-build.sh badsig $MIN ok bad && sh /root/mirror-build.sh nosig $MIN ok none"
+run "sh /root/mirror-build.sh otherkey $MIN ok otherkey && sh /root/mirror-build.sh emptysig $MIN ok empty"
 render "$ORIGIN/badsig" /root/install-badsig.sh
 render "$ORIGIN/nosig" /root/install-nosig.sh
+render "$ORIGIN/otherkey" /root/install-otherkey.sh
+render "$ORIGIN/emptysig" /root/install-emptysig.sh
 rc=$(run_rc "sh /root/install-badsig.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check bad-signature-refused '[ "$rc" = 1 ] && out_has "signature does NOT verify" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 rc=$(run_rc "sh /root/install-nosig.sh --endpoint=$ENDPOINT --api-key=$KEY")
-check missing-signature-refused '[ "$rc" = 1 ] && out_has "SHA256SUMS.sig is missing" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
+check missing-signature-refused '[ "$rc" = 1 ] && out_has "Could not download SHA256SUMS.sig" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+rc=$(run_rc "sh /root/install-otherkey.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check other-key-signature-refused '[ "$rc" = 1 ] && out_has "signature does NOT verify" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+rc=$(run_rc "sh /root/install-emptysig.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check empty-signature-refused '[ "$rc" = 1 ] && out_has "signature does NOT verify" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A key-free UPDATE against a bad signature leaves the installed agent exactly as it was:
+# same binary bytes, service still running.
+rc=$(run_rc "sh /root/install.sh --endpoint=$ENDPOINT --api-key=$KEY")
+GOOD_SHA="$(run "sha256sum /opt/monitorable/monitorable-agent 2>/dev/null" | cut -d' ' -f1)"
+check keyfree-badsig-precondition '[ "$rc" = 0 ] && [ -n "$GOOD_SHA" ] && run "systemctl is-active --quiet monitorable-agent"'
+rc=$(run_rc "sh /root/install-badsig.sh")
+check keyfree-update-bad-signature-untouched '[ "$rc" = 1 ] && out_has "Updating the existing agent" && out_has "signature does NOT verify" && [ "$(run "sha256sum /opt/monitorable/monitorable-agent" | cut -d" " -f1)" = "$GOOD_SHA" ] && run "systemctl is-active --quiet monitorable-agent"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # A template served without its placeholders filled is refused before anything else.
@@ -99,6 +121,14 @@ run "sh /root/mirror-build.sh old v1.2.9 ok ok"
 render "$ORIGIN/old" /root/install-old.sh
 rc=$(run_rc "sh /root/install-old.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check replay-below-floor-refused '[ "$rc" = 1 ] && out_has "older than this installer" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A version component too long for the shell's integer test (here 10 digits) is malformed,
+# never compared: it fails closed instead of erroring and falling through to the next one.
+run "sh /root/mirror-build.sh hugever v1.9999999999.0 ok ok"
+render "$ORIGIN/hugever" /root/install-hugever.sh
+rc=$(run_rc "sh /root/install-hugever.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check oversized-version-component-refused '[ "$rc" = 1 ] && out_has "older than this installer" && ! run "test -e /opt/monitorable/monitorable-agent"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # Numeric, not lexical: v1.10.0 clears a v1.9.0 floor.
@@ -137,6 +167,15 @@ check missing-version-line-refused '[ "$rc" = 1 ] && out_has "exactly one versio
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 rc=$(run_rc "sh /root/install-dupversion.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check duplicate-version-line-refused '[ "$rc" = 1 ] && out_has "exactly one version line" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A stale download left in a pre-existing, non-root-owned /opt/monitorable is never reused:
+# curl -o would write into that inode (still owned by its planter, who could rewrite it
+# after verification) and the rename would install it. The installed binary must be a new,
+# root-owned file.
+run "a=\$(dpkg --print-architecture) && mkdir -p /opt/monitorable && chown nobody:nogroup /opt/monitorable && printf planted > /opt/monitorable/monitorable-agent-linux-\$a.tmp && chown nobody:nogroup /opt/monitorable/monitorable-agent-linux-\$a.tmp"
+rc=$(run_rc "sh /root/install.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check stale-tmp-not-reused '[ "$rc" = 0 ] && [ "$(run "stat -c %U /opt/monitorable/monitorable-agent")" = root ]'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # fresh install with a key

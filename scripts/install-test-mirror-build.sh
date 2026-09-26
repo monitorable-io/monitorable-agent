@@ -2,11 +2,13 @@
 # Test-only mirror builder for scripts/test-install-lifecycle.sh. Runs INSIDE the LXD
 # container: builds /root/mirrors/<name>/ from the genuine staging files in
 # /root/mirrors/src, signed with the harness's throwaway key /root/tls/sign.key.
-# Usage: mirror-build.sh <name> <version> <ok|tampered> <ok|bad|none> [<dir>]
+# Usage: mirror-build.sh <name> <version> <ok|tampered> <ok|bad|otherkey|empty|none> [<dir>]
 #   <version>: vX.Y.Z written as "# version vX.Y.Z"; "-" writes no version line; "dup"
 #              writes two ("v1.3.0" and "v9.9.9")
 #   binary:    ok = genuine; tampered = one byte appended
-#   signature: ok = valid; bad = a valid signature over OTHER bytes; none = no .sig
+#   signature: ok = valid; bad = a valid signature over OTHER bytes; otherkey = a valid
+#              signature over THESE sums by a different key (/root/tls/other.key, the
+#              realistic attacker); empty = a zero-byte .sig; none = no .sig
 #   <dir>:     binaries/otel/<dir>/ (default latest). Other dirs of <name> are kept.
 set -eu
 name=$1 ver=$2 bin=$3 sig=$4 dir=${5:-latest}
@@ -30,5 +32,8 @@ if [ "$bin" = tampered ]; then printf x >> "$d/monitorable-agent-linux-$arch"; f
 case "$sig" in
     ok) openssl dgst -sha256 -sign /root/tls/sign.key -out "$d/SHA256SUMS.sig" "$d/SHA256SUMS" ;;
     bad) printf 'other bytes' | openssl dgst -sha256 -sign /root/tls/sign.key -out "$d/SHA256SUMS.sig" ;;
+    otherkey) openssl dgst -sha256 -sign /root/tls/other.key -out "$d/SHA256SUMS.sig" "$d/SHA256SUMS" ;;
+    empty) : > "$d/SHA256SUMS.sig" ;;
     none) ;;
+    *) echo "mirror-build: unknown signature mode '$sig'" >&2; exit 1 ;;
 esac
