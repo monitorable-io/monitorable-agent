@@ -1,22 +1,21 @@
 #!/bin/sh
 
 # Monitorable agent installer
-# Usage (preferred — keeps the key out of argv and out of sudo's auth.log). Get a root
-# shell first, then export and pipe inside it — don't use sudo's -E flag: sudo-rs,
-# Ubuntu's default sudo since 25.10, doesn't implement -E at all, and some sudoers
-# policies refuse it even where it's implemented. A `VAR=x curl ... | sudo sh` prefix
-# doesn't work either; it would apply to curl, which is the left side of the pipe, and
-# never reach sudo.
+# Usage: run the install command your dashboard shows (Servers → Add server). It fetches
+# this script from the Monitorable installer host and passes --endpoint= and the key.
+# Preferred (keeps the key out of argv and out of sudo's auth.log). Get a root shell first,
+# then export and pipe inside it — don't use sudo's -E flag: sudo-rs, Ubuntu's default sudo
+# since 25.10, doesn't implement -E at all, and some sudoers policies refuse it even where
+# it's implemented. A `VAR=x curl ... | sudo sh` prefix doesn't work either; it would apply
+# to curl, the left side of the pipe, and never reach sudo.
 #   sudo -s
 #   export MONITORABLE_API_KEY=<key>
-#   curl -fsSL @@BASE_URL@@/install.sh | sh -s -- --endpoint=<url>
-# Fallback, when a root shell isn't available:
-#   curl -fsSL @@BASE_URL@@/install.sh | sudo sh -s -- --api-key=<key>
-# The fallback puts the key in the world-readable /proc/<pid>/cmdline for the whole run
-# and in sudo's auth.log — prefer the root-shell form wherever you can.
+#   curl --proto '=https' --tlsv1.2 -fsSL <installer URL>/install.sh | sh -s -- --endpoint=<url>
+# The fallback (--api-key=<key> on the command line) puts the key in the world-readable
+# /proc/<pid>/cmdline for the whole run and in sudo's auth.log.
 # Optional: --endpoint=https://ingest.monitorable.net (default), --version=vX.Y.Z
-# Update (key and endpoint from /etc/monitorable/agent.env): curl -fsSL @@BASE_URL@@/install.sh | sudo sh
-# Uninstall: curl -fsSL @@BASE_URL@@/install.sh | sudo sh -s -- --uninstall
+# Update (key and endpoint from /etc/monitorable/agent.env): the same pipe, no options.
+# Uninstall: the same pipe with --uninstall.
 
 set -e
 
@@ -55,6 +54,12 @@ CONFIG_DIR="/etc/monitorable"
 BINARY_NAME="monitorable-agent"
 SERVICE_NAME="monitorable-agent"
 BASE_URL="@@BASE_URL@@"
+# Filled when this script is served (distribution/README.md "Integrity"): BASE_URL and
+# SIGNING_PUBKEY by the backend at serve time, MIN_VERSION when the backend vendors this
+# file (publish-dist.sh fills all three for the transitional copy on R2). SIGNING_PUBKEY
+# is one line: the base64 DER SubjectPublicKeyInfo of the release-signing ECDSA P-256 key.
+SIGNING_PUBKEY="@@SIGNING_PUBKEY@@"
+MIN_VERSION="@@MIN_VERSION@@"
 VERSION="latest"
 # Not USER/GROUP: those are exported by sudo and reassigning them would change $USER for
 # the rest of this script and every child process.
@@ -102,6 +107,23 @@ if [ "$UNINSTALL" -eq 1 ] && [ "$OTHER_OPTS" -eq 1 ]; then
     printf '%b' "${RED}--uninstall takes no other options${NC}\n"
     exit 1
 fi
+
+# A served installer has all three values filled. A leftover placeholder means the server
+# that sent this script did not render it — refuse before touching anything. The marker
+# is spelled "@""@" so this file carries no literal one outside the three placeholders.
+_ph="@""@"
+case "$BASE_URL$SIGNING_PUBKEY$MIN_VERSION" in
+    *"$_ph"*)
+        printf '%b' "${RED}This installer was served unrendered. Use the install command from your dashboard.${NC}\n"
+        exit 1
+        ;;
+esac
+case "$SIGNING_PUBKEY" in
+    ''|*[!A-Za-z0-9+/=]*)
+        printf '%b' "${RED}This installer carries a malformed signing key.${NC}\n"
+        exit 1
+        ;;
+esac
 
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -307,6 +329,7 @@ UNIT_FILE="$SERVICE_NAME.service"
 
 COLLECTOR_URL="$BASE_URL/binaries/otel/$VERSION/$BINARY_FILE"
 SUMS_URL="$BASE_URL/binaries/otel/$VERSION/SHA256SUMS"
+SIG_URL="$BASE_URL/binaries/otel/$VERSION/SHA256SUMS.sig"
 CONFIG_URL="$BASE_URL/configs/linux/$CONFIG_FILE"
 SERVICE_FILE_URL="$BASE_URL/configs/linux/$UNIT_FILE"
 
@@ -324,6 +347,11 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 if ! command -v sha256sum >/dev/null 2>&1; then
     printf '%b' "${RED}sha256sum (coreutils) is required but not installed.${NC}\n"
+    exit 1
+fi
+if ! command -v openssl >/dev/null 2>&1; then
+    printf '%b' "${RED}openssl is required to verify the release signature but is not installed.${NC}\n"
+    printf '%b' "Install it (apt-get install -y openssl / dnf install -y openssl) and re-run.\n"
     exit 1
 fi
 # systemd is the only supported init: the agent's security model is its sandboxed unit.
@@ -367,11 +395,13 @@ chmod 755 "$CONFIG_DIR"
 # root-written file is a symlink-attack target) and are moved into place only at the end,
 # so a failed download or a checksum mismatch leaves the previous install intact and
 # running rather than taking the host down to no agent at all.
-# What SHA256SUMS does NOT protect: it is fetched from the same bucket over the same TLS
-# channel and is unsigned — see distribution/README.md.
+# SHA256SUMS itself is verified against the embedded signing key below, before any of its
+# entries are trusted — see distribution/README.md "Integrity".
 printf '%b' "${YELLOW}📦 Downloading the Monitorable agent...${NC}\n"
 TMP_BIN="$INSTALL_DIR/$BINARY_FILE.tmp"
 TMP_SUMS="$INSTALL_DIR/SHA256SUMS.tmp"
+TMP_SIG="$INSTALL_DIR/SHA256SUMS.sig.tmp"
+TMP_PUB="$INSTALL_DIR/signing.pub.tmp"
 TMP_UNIT="$INSTALL_DIR/$UNIT_FILE.tmp"
 TMP_UNIT_SUBST="$INSTALL_DIR/$UNIT_FILE.subst.tmp"
 # Staged on the SAME filesystem as their destination so the final `mv` is a rename and
@@ -383,7 +413,7 @@ TMP_CONFIG="$CONFIG_DIR/$CONFIG_FILE.tmp"
 TMP_UNIT_RENDERED="/etc/systemd/system/.$UNIT_FILE.tmp"
 
 cleanup_tmp() {
-    rm -f "$TMP_BIN" "$TMP_SUMS" "$TMP_CONFIG" "$TMP_UNIT" "$TMP_UNIT_SUBST" "$TMP_UNIT_RENDERED"
+    rm -f "$TMP_BIN" "$TMP_SUMS" "$TMP_SIG" "$TMP_PUB" "$TMP_CONFIG" "$TMP_UNIT" "$TMP_UNIT_SUBST" "$TMP_UNIT_RENDERED"
 }
 # Runs cleanup_tmp on any exit (error or otherwise) between now and the last install
 # `mv` below, so an abort anywhere in the download/verify/install sequence (a failed
@@ -400,6 +430,10 @@ fetch() {
         *) curl -fsSL "$1" -o "$2" ;;
     esac
 }
+# Start from no staged files at all: a .tmp left in a directory that a non-root user owned
+# before the chown above could be a hard link to an inode that user owns, and curl -o
+# writes into an existing file rather than replacing it.
+cleanup_tmp
 if ! fetch "$COLLECTOR_URL" "$TMP_BIN" ||
    ! fetch "$SUMS_URL" "$TMP_SUMS" ||
    ! fetch "$CONFIG_URL" "$TMP_CONFIG" ||
@@ -408,6 +442,51 @@ if ! fetch "$COLLECTOR_URL" "$TMP_BIN" ||
     printf '%b' "${RED}❌ Failed to download the Monitorable agent distribution${NC}\n"
     exit 1
 fi
+
+# The signature is fetched separately so its failure says so: a missing .sig is never
+# "unsigned mode" — every release since v1.3.0 carries one. curl cannot tell a 404 from a
+# network or TLS failure here, so the message names both.
+if ! fetch "$SIG_URL" "$TMP_SIG"; then
+    cleanup_tmp
+    printf '%b' "${RED}❌ Could not download SHA256SUMS.sig — this release is unsigned or the download failed. Nothing was installed.${NC}\n"
+    exit 1
+fi
+# SHA256SUMS is trusted only once its signature verifies against the key embedded in this
+# script — served by the backend, never from the download host, so writing the download
+# bucket is not enough to forge it. openssl wants PEM with lines of at most 64 characters.
+{
+    printf '%s\n' '-----BEGIN PUBLIC KEY-----'
+    printf '%s\n' "$SIGNING_PUBKEY" | fold -w 64
+    printf '%s\n' '-----END PUBLIC KEY-----'
+} > "$TMP_PUB"
+if ! openssl dgst -sha256 -verify "$TMP_PUB" -signature "$TMP_SIG" "$TMP_SUMS" >/dev/null 2>&1; then
+    cleanup_tmp
+    printf '%b' "${RED}❌ SHA256SUMS signature does NOT verify: nothing installed; any existing agent is untouched.${NC}\n"
+    exit 1
+fi
+
+# version_ge A B: true when release A >= release B. Both must be vMAJOR.MINOR.PATCH with
+# numeric parts of at most 9 digits; anything else is false, so a malformed version fails
+# closed. Compared per component as integers: v1.10.0 is newer than v1.9.0. The digit cap
+# keeps every component inside the shell's integer range: a longer one makes `[` error out,
+# and inside `if` that error reads as "not equal" and falls through to the next component.
+version_ge() {
+    for _v in "$1" "$2"; do
+        case "$_v" in v?*) ;; *) return 1 ;; esac
+        case "${_v#v}" in
+            *[!0-9.]*|*.*.*.*|*..*|.*|*.) return 1 ;;
+            *[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 1 ;;
+            *.*.*) ;;
+            *) return 1 ;;
+        esac
+    done
+    _a="${1#v}"; _b="${2#v}"
+    _a1="${_a%%.*}"; _a="${_a#*.}"; _a2="${_a%%.*}"; _a3="${_a#*.}"
+    _b1="${_b%%.*}"; _b="${_b#*.}"; _b2="${_b%%.*}"; _b3="${_b#*.}"
+    if [ "$_a1" -ne "$_b1" ]; then [ "$_a1" -gt "$_b1" ]; return; fi
+    if [ "$_a2" -ne "$_b2" ]; then [ "$_a2" -gt "$_b2" ]; return; fi
+    [ "$_a3" -ge "$_b3" ]
+}
 
 # verify <downloaded path> <name as listed in SHA256SUMS>. Exact field match via awk, so a
 # name that is a suffix of another cannot be confused; a missing entry leaves EXPECTED
@@ -425,15 +504,36 @@ verify() {
         exit 1
     fi
 }
+
+# The version is inside the signed file, so an old, validly signed release can't be
+# replayed as "latest", and a pin gets exactly what it asked for.
+refuse_version() {
+    cleanup_tmp
+    printf '%b' "${RED}❌ ${NC}"
+    printf '%s\n' "$1"
+    printf '%b' "${RED}   Nothing was installed; any existing agent is untouched.${NC}\n"
+    exit 1
+}
+if [ "$(grep -c '^# version ' "$TMP_SUMS")" -ne 1 ]; then
+    refuse_version "SHA256SUMS must carry exactly one version line"
+fi
+SIGNED_VERSION="$(sed -n 's/^# version //p' "$TMP_SUMS")"
+if [ "$VERSION" = "latest" ]; then
+    version_ge "$SIGNED_VERSION" "$MIN_VERSION" ||
+        refuse_version "refusing $SIGNED_VERSION: older than this installer's minimum $MIN_VERSION"
+elif [ "$SIGNED_VERSION" != "$VERSION" ]; then
+    refuse_version "refusing $SIGNED_VERSION: not the requested $VERSION"
+fi
+
 verify "$TMP_BIN" "$BINARY_FILE"
 BIN_SHA256="$_actual"
 verify "$TMP_CONFIG" "$CONFIG_FILE"
 verify "$TMP_UNIT" "$UNIT_FILE"
-rm -f "$TMP_SUMS"
+rm -f "$TMP_SUMS" "$TMP_SIG" "$TMP_PUB"
 printf '%b' "${GREEN}✅ Binary, config and unit template verified against SHA256SUMS${NC}\n"
 # Named so the output records which bytes this host got; each release's SHA256SUMS is also
 # attached to its GitHub release, an origin independent of this download host.
-printf '   %s sha256 %s\n' "$BINARY_FILE" "$BIN_SHA256"
+printf '   %s %s sha256 %s\n' "$BINARY_FILE" "$SIGNED_VERSION" "$BIN_SHA256"
 
 # Create user and group — only now that everything downloaded has verified.
 printf '%b' "${YELLOW}👤 Creating user and group...${NC}\n"

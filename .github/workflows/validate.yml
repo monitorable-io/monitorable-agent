@@ -34,7 +34,73 @@ jobs:
             echo "shellcheck not found on runner" >&2
             exit 1
           fi
-          shellcheck distribution/install.sh scripts/publish-dist.sh
+          shellcheck distribution/install.sh distribution/install-stub.sh scripts/publish-dist.sh
+      - name: Signing dry-run (publish-dist.sh --render-only with a throwaway key)
+        run: |
+          set -eu
+          key="$RUNNER_TEMP/k.pem"; pub="$RUNNER_TEMP/k.pub"; other="$RUNNER_TEMP/other.pem"
+          openssl ecparam -name prime256v1 -genkey -noout -out "$key"
+          openssl pkey -in "$key" -pubout -out "$pub"
+          STUB_INSTALLER=0 RELEASE_SIGNING_KEY="$(cat "$key")" EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
+            scripts/publish-dist.sh staging --render-only
+          b=distribution-build/binaries/otel
+          openssl dgst -sha256 -verify "$pub" -signature "$b/SHA256SUMS.sig" "$b/SHA256SUMS"
+          head -n 1 "$b/SHA256SUMS" | grep -qx '# version v0.0.0'
+          test "$(grep -c '^# version ' "$b/SHA256SUMS")" -eq 1
+          if grep -q '@@' distribution-build/install.sh; then
+            echo "FAIL: unrendered placeholder in install.sh"; exit 1
+          fi
+          grep -qF "SIGNING_PUBKEY=\"$(grep -v -- '-----' "$pub" | tr -d '\n')\"" distribution-build/install.sh
+          grep -qx 'MIN_VERSION="v0.0.0"' distribution-build/install.sh
+          # refuses <expected message> <command...>: the command must fail AND say why, so a
+          # refusal for some other reason (missing file, unreachable URL) fails the job. The
+          # command line is never echoed: it carries the (throwaway) private key.
+          refuses() {
+            local msg="$1" out
+            shift
+            if out="$("$@" 2>&1)"; then
+              echo "FAIL: accepted, expected a refusal with '$msg'"; exit 1
+            fi
+            if ! grep -qF -- "$msg" <<<"$out"; then
+              echo "FAIL: refused, but not with '$msg':"; printf '%s\n' "$out"; exit 1
+            fi
+            echo "ok: refused with '$msg'"
+          }
+          # A key that does not match the expected public key is refused before any build.
+          openssl ecparam -name prime256v1 -genkey -noout -out "$other"
+          refuses "does not match" env RELEASE_SIGNING_KEY="$(cat "$other")" EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
+            scripts/publish-dist.sh staging --render-only
+          # No key at all is refused.
+          refuses "RELEASE_SIGNING_KEY is not set" env -u RELEASE_SIGNING_KEY EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
+            scripts/publish-dist.sh staging --render-only
+          # A VERSION install.sh would never accept (a pre-release tag) is refused before
+          # anything is signed: it would become MIN_VERSION and brick every latest install.
+          refuses "VERSION must look like vX.Y.Z" env RELEASE_SIGNING_KEY="$(cat "$key")" EXPECTED_PUBKEY_FILE="$pub" \
+            VERSION=v1.3.0-rc.1 scripts/publish-dist.sh staging --render-only
+          # The installer-key matcher reads the whole body: under pipefail, a matcher that
+          # stops at the first match makes the writer die of SIGPIPE on a large body and turns
+          # a served key into "not served". Extracted from the script, no test hook in it.
+          matcher="$(sed -n '/^installer_body_has_key() {$/,/^}$/p' scripts/publish-dist.sh)"
+          test -n "$matcher"
+          if ! bash -c 'set -euo pipefail; eval "$1"; PUBKEY_LINE=TESTKEY
+                 { head -c 40000 /dev/zero | tr "\0" x; printf "\nSIGNING_PUBKEY=\"TESTKEY\"\n"; head -c 400000 /dev/zero | tr "\0" y; } | installer_body_has_key' _ "$matcher"; then
+            echo "FAIL: the installer-key matcher missed the key in a large body"; exit 1
+          fi
+          if bash -c 'set -euo pipefail; eval "$1"; PUBKEY_LINE=TESTKEY
+                 { head -c 40000 /dev/zero | tr "\0" x; printf "\nSIGNING_PUBKEY=\"OTHERKEY\"\n"; head -c 400000 /dev/zero | tr "\0" y; } | installer_body_has_key' _ "$matcher"; then
+            echo "FAIL: the installer-key matcher accepted a body without the key"; exit 1
+          fi
+          # Stub preflight: a URL that answers 200 with a DIFFERENT key (this commit's own
+          # template, whose key is the placeholder) must not get the stub. The URL must be
+          # reachable first, so the refusal is about the key.
+          tpl="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/distribution"
+          curl --proto '=https' -fsS -o /dev/null "$tpl/install.sh"
+          refuses "is not live with this env's signing key" env STUB_INSTALLER=1 INSTALLER_URL="$tpl" \
+            RELEASE_SIGNING_KEY="$(cat "$key")" EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
+            scripts/publish-dist.sh staging --render-only
+          # The same check on its own, without any private key or VERSION.
+          refuses "is not live with this env's signing key" env -u RELEASE_SIGNING_KEY -u VERSION INSTALLER_URL="$tpl" \
+            EXPECTED_PUBKEY_FILE="$pub" scripts/publish-dist.sh staging --check-installer
       - name: Cross-compile smoke (linux amd64+arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/agent-amd64 ./cmd/monitorable-agent

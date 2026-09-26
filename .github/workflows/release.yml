@@ -67,6 +67,11 @@ jobs:
       - name: Publish versioned distribution to staging R2
         if: github.event_name == 'push'
         run: scripts/publish-dist.sh staging
+        # The signing key reaches this one step only: not the test gate (go test runs
+        # dependency init code), not the preflight. publish-dist.sh moves it into a 0600
+        # temp file and unsets it before building.
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       - name: Enforce R2 retention only (manual dispatch)
         if: github.event_name == 'workflow_dispatch'
         run: scripts/publish-dist.sh staging --prune-only
@@ -77,8 +82,10 @@ jobs:
         # in a job that holds contents:write and the staging environment's R2 token.
         # SHA256SUMS rides along as an asset: an origin independent of the R2 bucket to
         # compare the digest install.sh prints against. Builds are reproducible (v1.2.2's
-        # staging and prod sums are byte-identical), so it holds for prod's rebuild too.
-        run: gh release create "$TAG" --generate-notes distribution-build/binaries/otel/SHA256SUMS
+        # staging and prod sums are byte-identical), so it holds for prod's rebuild too
+        # …and SHA256SUMS.sig, signed with the staging key. Prod re-signs its own
+        # byte-identical sums with the prod key; verify those with distribution/keys/prod.pub.
+        run: gh release create "$TAG" --generate-notes distribution-build/binaries/otel/SHA256SUMS distribution-build/binaries/otel/SHA256SUMS.sig
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
@@ -141,6 +148,9 @@ jobs:
         run: scripts/publish-dist.sh prod --preflight
       - name: Publish versioned distribution to prod R2 (get.monitorable.io)
         run: scripts/publish-dist.sh prod
+        # Step-scoped, as in the staging job: the test gate never sees the signing key.
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
       - name: Record what was published
         env:
           TAG: ${{ inputs.tag }}

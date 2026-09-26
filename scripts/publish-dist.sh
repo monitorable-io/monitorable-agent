@@ -2,12 +2,17 @@
 # Build Monitorable agent binaries, render install.sh for the target env, and publish
 # the full distribution (install.sh + configs + binaries) to that env's R2 bucket.
 #
-# Usage: scripts/publish-dist.sh <staging|prod> [--render-only|--prune-only|--preflight]
-#   --render-only : build + render into ./distribution-build, skip R2 upload
-#                   (CI dry-run / local test; no Cloudflare creds needed).
-#   --prune-only  : enforce R2 retention only (delete old versioned binaries), no build/publish
-#   --preflight   : prove the credentials can write this env's bucket (put + delete one
-#                   tiny object) and exit; no build. The release jobs run this first.
+# Usage: scripts/publish-dist.sh <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]
+#   --render-only     : build + render into ./distribution-build, skip R2 upload
+#                       (CI dry-run / local test; no Cloudflare creds needed).
+#   --prune-only      : enforce R2 retention only (delete old versioned binaries), no build/publish
+#   --preflight       : prove the credentials can write this env's bucket (put + delete one
+#                       tiny object) and exit; no build. The release jobs run this first.
+#   --check-installer : check whether this env's backend already serves an installer that
+#                       embeds this env's signing key (gates STUB_INSTALLER); no build, no key.
+#
+# VERSION (env) must be a plain release tag vX.Y.Z for a build (the release job passes the
+# pushed tag); --preflight, --prune-only and --check-installer do not use it.
 #
 # Credentials (env): CLOUDFLARE_R2_TOKEN = an R2 API token with "Object Read & Write"
 # scoped to THIS env's bucket only, and CLOUDFLARE_ACCOUNT_ID. Uploads go over R2's S3
@@ -28,9 +33,11 @@ VERSION="${VERSION:-dev}"
 # not exist for the token — R2 answers AccessDenied, not NoSuchBucket (prod, 2026-09-22).
 # The dashboard's token page lists the endpoints its buckets need.
 case "$ENV" in
-  staging) BASE_URL="https://get-mon.ok9k.com"; BUCKET="monitorable-get-staging"; R2_JURISDICTION="${R2_JURISDICTION-}" ;;
-  prod)    BASE_URL="https://get.monitorable.io"; BUCKET="monitorable-get-prod";   R2_JURISDICTION="${R2_JURISDICTION-eu}" ;;
-  *) echo "usage: $0 <staging|prod> [--render-only|--prune-only|--preflight]" >&2; exit 1 ;;
+  staging) BASE_URL="https://get-mon.ok9k.com"; BUCKET="monitorable-get-staging"; R2_JURISDICTION="${R2_JURISDICTION-}"
+           INSTALLER_URL="${INSTALLER_URL:-https://install-mon.ok9k.com}"; STUB_INSTALLER="${STUB_INSTALLER:-0}" ;;
+  prod)    BASE_URL="https://get.monitorable.io"; BUCKET="monitorable-get-prod";   R2_JURISDICTION="${R2_JURISDICTION-eu}"
+           INSTALLER_URL="${INSTALLER_URL:-https://get.monitorable.net}"; STUB_INSTALLER="${STUB_INSTALLER:-0}" ;;
+  *) echo "usage: $0 <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]" >&2; exit 1 ;;
 esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -107,6 +114,7 @@ prune_old_r2_versions() {
       done
     done
     if r2_delete "binaries/otel/$v/SHA256SUMS"; then echo "  pruned binaries/otel/$v/SHA256SUMS (or already absent)"; else echo "  (delete FAILED for $v/SHA256SUMS)"; fi
+    if r2_delete "binaries/otel/$v/SHA256SUMS.sig"; then echo "  pruned binaries/otel/$v/SHA256SUMS.sig (or already absent)"; else echo "  (delete FAILED for $v/SHA256SUMS.sig)"; fi
   done
 }
 
@@ -116,14 +124,76 @@ if [ "$MODE" = "--prune-only" ]; then
   echo "prune-only complete"; exit 0
 fi
 
+# --- Release signing (spec 2026-09-26-installer-signing-design.md §4.2) ---
+# Every published SHA256SUMS is signed with this env's key, which lives only in the agent
+# repo's GitHub environment (and Infisical, for DR). The committed public key is the
+# reference: a key that does not match it is refused before anything is built.
+EXPECTED_PUBKEY_FILE="${EXPECTED_PUBKEY_FILE:-$SRC/keys/${ENV}.pub}"
+[ -f "$EXPECTED_PUBKEY_FILE" ] || { echo "ERROR: no public key at $EXPECTED_PUBKEY_FILE" >&2; exit 1; }
+# The one-line form install.sh embeds: base64 DER SubjectPublicKeyInfo, no PEM armour.
+pem_body() { grep -v -- '-----' | tr -d '\n'; }
+PUBKEY_LINE="$(pem_body < "$EXPECTED_PUBKEY_FILE")"
+
+# installer_serves_key: true when this env's backend serves an installer that embeds THIS
+# env's key. Gates the stub, so R2 never loses the real installer before the backend has it.
+# The body is fetched completely before it is matched, and the matcher reads ALL of its
+# input (grep -c, never -q): under pipefail, a reader that stops at the first match kills
+# its writer with SIGPIPE once the rest of the body outgrows the pipe buffer, and the
+# pipeline then reports a served key as "not served". validate.yml tests the matcher.
+installer_body_has_key() {
+  [ "$(grep -cF -- "SIGNING_PUBKEY=\"$PUBKEY_LINE\"")" -gt 0 ]
+}
+installer_serves_key() {
+  local body
+  body="$(curl --proto '=https' --tlsv1.2 -fsS "$INSTALLER_URL/install.sh")" || return 1
+  installer_body_has_key <<<"$body"
+}
+if [ "$MODE" = "--check-installer" ]; then
+  if installer_serves_key; then echo "installer OK: $INSTALLER_URL/install.sh embeds this env's key"; exit 0; fi
+  echo "ERROR: $INSTALLER_URL/install.sh is not live with this env's signing key" >&2; exit 1
+fi
+
+# VERSION becomes the installer's MIN_VERSION and the signed `# version` line, and install.sh
+# accepts only vX.Y.Z: anything else (a pre-release tag, the unset default "dev") would
+# brick every latest install, and a `|` or `&` in it would corrupt the sed rendering below.
+# Components are capped at 9 digits, as install.sh's version_ge caps them.
+if ! [[ "$VERSION" =~ ^v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$ ]]; then
+  echo "ERROR: VERSION must look like vX.Y.Z (got '$VERSION')" >&2; exit 1
+fi
+
+if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+  echo "ERROR: RELEASE_SIGNING_KEY is not set: every published SHA256SUMS must be signed" >&2; exit 1
+fi
+SIGNING_KEY_FILE="$(mktemp)"
+trap 'rm -f "$SIGNING_KEY_FILE"' EXIT
+printf '%s\n' "$RELEASE_SIGNING_KEY" > "$SIGNING_KEY_FILE"
+# From here on only the 0600 temp file holds the key: nothing this script runs (go build,
+# openssl, aws, curl) inherits it through the environment.
+unset RELEASE_SIGNING_KEY
+if [ "$(openssl pkey -in "$SIGNING_KEY_FILE" -pubout 2>/dev/null | pem_body)" != "$PUBKEY_LINE" ]; then
+  echo "ERROR: RELEASE_SIGNING_KEY does not match $EXPECTED_PUBKEY_FILE — refusing to sign" >&2; exit 1
+fi
+
 rm -rf "$OUT"
 mkdir -p "$OUT/configs" "$BINOUT"
 
-# 1. Render install.sh (bake BASE_URL)
-sed "s|@@BASE_URL@@|$BASE_URL|g" "$SRC/install.sh" > "$OUT/install.sh"
+# 1. Render the object served at <bucket>/install.sh. Until this env's backend serves the
+# installer, that is the real installer with all three values filled (it verifies
+# signatures but is anchored in this bucket). Afterwards (STUB_INSTALLER=1) it is the stub,
+# and only if the backend demonstrably serves an installer carrying THIS env's key.
+if [ "$STUB_INSTALLER" = 1 ]; then
+  if ! installer_serves_key; then
+    echo "ERROR: $INSTALLER_URL/install.sh is not live with this env's signing key — refusing to publish the stub" >&2
+    exit 1
+  fi
+  sed "s|@@INSTALLER_URL@@|$INSTALLER_URL|g" "$SRC/install-stub.sh" > "$OUT/install.sh"
+else
+  sed -e "s|@@BASE_URL@@|$BASE_URL|g" -e "s|@@SIGNING_PUBKEY@@|$PUBKEY_LINE|g" -e "s|@@MIN_VERSION@@|$VERSION|g" \
+    "$SRC/install.sh" > "$OUT/install.sh"
+fi
 chmod +x "$OUT/install.sh"
-if grep -q '@@BASE_URL@@' "$OUT/install.sh"; then
-  echo "ERROR: unrendered @@BASE_URL@@ remains in install.sh" >&2; exit 1
+if grep -q '@@' "$OUT/install.sh"; then
+  echo "ERROR: an unrendered placeholder remains in install.sh" >&2; exit 1
 fi
 
 # 2. Stage the configs to publish. Published surface is Linux-only.
@@ -148,18 +218,28 @@ build linux arm64
 # 3b. Checksums for the installer's verification step. ONE SHA256SUMS covers every file
 # install.sh downloads — both binaries, the collector config and the systemd unit template
 # — because the unit template is sed-rendered into /etc/systemd/system and daemon-reloaded,
-# i.e. an unverified one is an arbitrary ExecStart on every installing host.
+# i.e. an unverified one is an arbitrary ExecStart on every installing host. The first line
+# is a `# version vX.Y.Z` comment install.sh checks against its pinned/floor versions before
+# trusting the rest; `sha256sum -c` warns about that comment line, which is expected.
 # The two config files are copied into $BINOUT purely so the four entries can be generated
 # (and verified locally with `cd distribution-build/binaries/otel && sha256sum -c
 # SHA256SUMS`) under BARE relative names, which is how install.sh looks them up. They are
 # PUBLISHED from $OUT/configs below; the upload loop here globs monitorable-agent-linux-*
 # only, so these copies never reach the bucket.
 cp "$OUT/configs/linux/collector-config.yaml" "$OUT/configs/linux/monitorable-agent.service" "$BINOUT/"
-( cd "$BINOUT" && sha256sum \
-    monitorable-agent-linux-amd64 \
-    monitorable-agent-linux-arm64 \
-    collector-config.yaml \
-    monitorable-agent.service > SHA256SUMS )
+( cd "$BINOUT" && {
+    printf '# version %s\n' "$VERSION"
+    sha256sum \
+      monitorable-agent-linux-amd64 \
+      monitorable-agent-linux-arm64 \
+      collector-config.yaml \
+      monitorable-agent.service
+  } > SHA256SUMS )
+openssl dgst -sha256 -sign "$SIGNING_KEY_FILE" -out "$BINOUT/SHA256SUMS.sig" "$BINOUT/SHA256SUMS"
+# Prove the signature with the committed public key before anything leaves this machine.
+if ! openssl dgst -sha256 -verify "$EXPECTED_PUBKEY_FILE" -signature "$BINOUT/SHA256SUMS.sig" "$BINOUT/SHA256SUMS" >/dev/null; then
+  echo "ERROR: the fresh SHA256SUMS signature does not verify with $EXPECTED_PUBKEY_FILE" >&2; exit 1
+fi
 
 if [ "$MODE" = "--render-only" ]; then
   echo "render-only: artifacts in $OUT"; exit 0
@@ -187,15 +267,18 @@ put() { # localpath key content-type
     attempt=$((attempt + 1))
   done
 }
-put "$OUT/install.sh" "install.sh" "text/x-shellscript"
 
-# Publish order is binaries → configs → SHA256SUMS, and SHA256SUMS is strictly last.
-# install.sh verifies the binary, the config AND the unit against that one object, so any
+# Publish order is binaries → configs → SHA256SUMS.sig → SHA256SUMS → install.sh.
+# install.sh verifies the binary, the config AND the unit against the one SHA256SUMS, so any
 # install that races this publish FAILS CLOSED — a new config or binary against the old
 # sums (or the reverse) aborts before anything is touched, and the operator retries. The
-# window is the length of this upload, a few minutes. Sums last keeps that window as short
-# as possible and keeps the previous set installable for as much of it as possible; it
-# does not eliminate it. Signed, versioned config objects would; see distribution/README.md.
+# window is the length of this upload, a few minutes. Sums after the payloads keeps that
+# window as short as possible and keeps the previous set installable for as much of it as
+# possible; it does not eliminate it. Signed, versioned config objects would; see
+# distribution/README.md. install.sh goes after the sums: the new installer's MIN_VERSION is
+# this release, so it must not go live before the signed sums that satisfy it (it would
+# refuse every install for the whole upload, and for good if a later put failed), while the
+# old installer, with its lower floor, accepts the new sums.
 # (Fail loud if the build produced no binaries, rather than uploading a literal glob.)
 shopt -s nullglob
 bins=("$BINOUT"/monitorable-agent-linux-*)
@@ -221,17 +304,16 @@ while IFS= read -r f; do
   put "$f" "$rel" "$ct"
 done < <(find "$OUT/configs" -type f)
 
+put "$BINOUT/SHA256SUMS.sig" "binaries/otel/${VERSION}/SHA256SUMS.sig" "application/octet-stream"
+put "$BINOUT/SHA256SUMS.sig" "binaries/otel/latest/SHA256SUMS.sig"     "application/octet-stream"
 put "$BINOUT/SHA256SUMS" "binaries/otel/${VERSION}/SHA256SUMS" "text/plain"
 put "$BINOUT/SHA256SUMS" "binaries/otel/latest/SHA256SUMS"     "text/plain"
+put "$OUT/install.sh" "install.sh" "text/x-shellscript"
 
 # 4b. Version manifest — the backend reads this (GET /latest.json) to compare
 # each server's reported agent version against the newest published one.
-if [ "$VERSION" = "dev" ]; then
-  echo "WARN: VERSION=dev — skipping latest.json (publish from a v* tag to update it)"
-else
-  printf '{"version":"%s"}\n' "$VERSION" > "$OUT/latest.json"
-  put "$OUT/latest.json" "latest.json" "application/json"
-fi
+printf '{"version":"%s"}\n' "$VERSION" > "$OUT/latest.json"
+put "$OUT/latest.json" "latest.json" "application/json"
 
 echo "published ${ENV} distribution to ${BUCKET}"
 
@@ -249,6 +331,8 @@ verify_published() {
     "install.sh=$OUT/install.sh"
     "binaries/otel/${VERSION}/SHA256SUMS=$BINOUT/SHA256SUMS"
     "binaries/otel/latest/SHA256SUMS=$BINOUT/SHA256SUMS"
+    "binaries/otel/${VERSION}/SHA256SUMS.sig=$BINOUT/SHA256SUMS.sig"
+    "binaries/otel/latest/SHA256SUMS.sig=$BINOUT/SHA256SUMS.sig"
     "configs/linux/collector-config.yaml=$OUT/configs/linux/collector-config.yaml"
     "configs/linux/monitorable-agent.service=$OUT/configs/linux/monitorable-agent.service"
   )
@@ -256,9 +340,7 @@ verify_published() {
   for f in "${bins[@]}"; do
     pairs+=("binaries/otel/${VERSION}/$(basename "$f")=$f" "binaries/otel/latest/$(basename "$f")=$f")
   done
-  if [ "$VERSION" != "dev" ]; then
-    pairs+=("latest.json=$OUT/latest.json")
-  fi
+  pairs+=("latest.json=$OUT/latest.json")
   local pair
   for pair in "${pairs[@]}"; do
     key="${pair%%=*}"; local_path="${pair#*=}"
@@ -273,6 +355,13 @@ verify_published() {
     done
     echo "verified $key"
   done
+  curl -fsSL "$BASE_URL/binaries/otel/latest/SHA256SUMS" -o "$vdir/sums"
+  curl -fsSL "$BASE_URL/binaries/otel/latest/SHA256SUMS.sig" -o "$vdir/sig"
+  if ! openssl dgst -sha256 -verify "$EXPECTED_PUBKEY_FILE" -signature "$vdir/sig" "$vdir/sums" >/dev/null; then
+    echo "ERROR: the served latest/SHA256SUMS does not verify with $EXPECTED_PUBKEY_FILE" >&2
+    return 1
+  fi
+  echo "verified the served signature"
   rm -rf "$vdir"
 }
 verify_published
