@@ -39,10 +39,10 @@ VERSION="${VERSION:-dev}"
 case "$ENV" in
   staging) BASE_URL="https://get-mon.ok9k.com"; BUCKET="monitorable-get-staging"; R2_JURISDICTION="${R2_JURISDICTION-}"
            INSTALLER_URL="${INSTALLER_URL:-https://install-mon.ok9k.com}"; STUB_INSTALLER="${STUB_INSTALLER:-0}"
-           BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-monitorable-install-staging}" ;;
+           BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-staging}" ;;
   prod)    BASE_URL="https://get.monitorable.io"; BUCKET="monitorable-get-prod";   R2_JURISDICTION="${R2_JURISDICTION-eu}"
            INSTALLER_URL="${INSTALLER_URL:-https://get.monitorable.net}"; STUB_INSTALLER="${STUB_INSTALLER:-0}"
-           BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-monitorable-install-prod}" ;;
+           BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-prod}" ;;
   *) echo "usage: $0 <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]" >&2; exit 1 ;;
 esac
 
