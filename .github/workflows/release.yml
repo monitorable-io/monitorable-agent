@@ -59,11 +59,14 @@ jobs:
         with: { go-version-file: go.mod, cache: true }
       - name: Test gate
         run: go build ./... && go vet ./... && go test -race ./...
-      - name: Preflight — prove the R2 credentials can write the staging bucket
+      - name: Preflight — prove the R2 and Bunny credentials can write the staging stores
         # publish-dist.sh derives S3 credentials from CLOUDFLARE_R2_TOKEN (a bucket-scoped
-        # "Object Read & Write" token) and does one put + delete of a tiny object. Fails in
-        # seconds with a named cause instead of five retries per object later.
+        # "Object Read & Write" token) and does one put + delete of a tiny object, then does
+        # the same put + delete against the Bunny installer zone with BUNNY_STORAGE_PASSWORD.
+        # Fails in seconds with a named cause instead of five retries per object later.
         run: scripts/publish-dist.sh staging --preflight
+        env:
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
       - name: Publish versioned distribution to staging R2
         if: github.event_name == 'push'
         run: scripts/publish-dist.sh staging
@@ -72,6 +75,7 @@ jobs:
         # temp file and unsets it before building.
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
       - name: Enforce R2 retention only (manual dispatch)
         if: github.event_name == 'workflow_dispatch'
         run: scripts/publish-dist.sh staging --prune-only
@@ -141,16 +145,20 @@ jobs:
         with: { go-version-file: go.mod, cache: true }
       - name: Test gate
         run: go build ./... && go vet ./... && go test -race ./...
-      - name: Preflight — prove the R2 credentials can write the prod bucket
+      - name: Preflight — prove the R2 and Bunny credentials can write the prod stores
         # publish-dist.sh derives S3 credentials from CLOUDFLARE_R2_TOKEN (a bucket-scoped
-        # "Object Read & Write" token) and does one put + delete of a tiny object. Fails in
-        # seconds with a named cause instead of five retries per object later.
+        # "Object Read & Write" token) and does one put + delete of a tiny object, then does
+        # the same put + delete against the Bunny installer zone with BUNNY_STORAGE_PASSWORD.
+        # Fails in seconds with a named cause instead of five retries per object later.
         run: scripts/publish-dist.sh prod --preflight
+        env:
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
       - name: Publish versioned distribution to prod R2 (get.monitorable.io)
         run: scripts/publish-dist.sh prod
         # Step-scoped, as in the staging job: the test gate never sees the signing key.
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
       - name: Record what was published
         env:
           TAG: ${{ inputs.tag }}

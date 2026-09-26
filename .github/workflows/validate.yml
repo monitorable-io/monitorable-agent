@@ -101,6 +101,25 @@ jobs:
           # The same check on its own, without any private key or VERSION.
           refuses "is not live with this env's signing key" env -u RELEASE_SIGNING_KEY -u VERSION INSTALLER_URL="$tpl" \
             EXPECTED_PUBKEY_FILE="$pub" scripts/publish-dist.sh staging --check-installer
+          # The rendered installer for the installer host is the real one, with this key.
+          grep -qF "SIGNING_PUBKEY=\"$(grep -v -- '-----' "$pub" | tr -d '\n')\"" distribution-build/installer/install.sh
+          grep -qx 'MIN_VERSION="v0.0.0"' distribution-build/installer/install.sh
+          # A publish without the Bunny storage password is refused before anything is built
+          # or uploaded (no R2 credentials exist here, so reaching R2 would fail differently).
+          refuses "BUNNY_STORAGE_PASSWORD is not set" env -u BUNNY_STORAGE_PASSWORD RELEASE_SIGNING_KEY="$(cat "$key")" \
+            EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 scripts/publish-dist.sh staging
+          # A value that is not a storage-zone password (it would also break curl's config
+          # syntax) is refused.
+          refuses "is not a Bunny storage-zone password" env BUNNY_STORAGE_PASSWORD='a"b' RELEASE_SIGNING_KEY="$(cat "$key")" \
+            EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 scripts/publish-dist.sh staging
+          # The password reaches curl on stdin, never in argv (visible in /proc to every
+          # process on the runner). A curl shim prints its argv; the password must not be in it.
+          bunny="$(sed -n '/^bunny_curl() {$/,/^}$/p' scripts/publish-dist.sh)"
+          test -n "$bunny"
+          argv="$(bash -c 'set -euo pipefail; eval "$1"; curl() { printf "%s\n" "$@"; cat >/dev/null; }
+                  BUNNY_STORAGE_PASSWORD=SECRET-0123 bunny_curl -X PUT https://example.invalid/z/f' _ "$bunny")"
+          if grep -q 'SECRET-0123' <<<"$argv"; then echo "FAIL: the Bunny password is in curl's argv"; exit 1; fi
+          grep -qx -- '-K' <<<"$argv"
       - name: Cross-compile smoke (linux amd64+arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/agent-amd64 ./cmd/monitorable-agent
