@@ -52,6 +52,14 @@ jobs:
           fi
           grep -qF "SIGNING_PUBKEY=\"$(grep -v -- '-----' "$pub" | tr -d '\n')\"" distribution-build/install.sh
           grep -qx 'MIN_VERSION="v0.0.0"' distribution-build/install.sh
+          # The rendered installer for the installer host is the real one, with this key,
+          # and (non-stub) byte-identical to the R2 object. Checked right after this first
+          # --render-only run: a later --render-only call in this step (e.g. the stub-refusal
+          # ones below) does `rm -rf`+re-render $OUT before failing, so these files would
+          # otherwise be a refused run's leftovers, not this run's.
+          grep -qF "SIGNING_PUBKEY=\"$(grep -v -- '-----' "$pub" | tr -d '\n')\"" distribution-build/installer/install.sh
+          grep -qx 'MIN_VERSION="v0.0.0"' distribution-build/installer/install.sh
+          cmp distribution-build/install.sh distribution-build/installer/install.sh
           # refuses <expected message> <command...>: the command must fail AND say why, so a
           # refusal for some other reason (missing file, unreachable URL) fails the job. The
           # command line is never echoed: it carries the (throwaway) private key.
@@ -101,9 +109,6 @@ jobs:
           # The same check on its own, without any private key or VERSION.
           refuses "is not live with this env's signing key" env -u RELEASE_SIGNING_KEY -u VERSION INSTALLER_URL="$tpl" \
             EXPECTED_PUBKEY_FILE="$pub" scripts/publish-dist.sh staging --check-installer
-          # The rendered installer for the installer host is the real one, with this key.
-          grep -qF "SIGNING_PUBKEY=\"$(grep -v -- '-----' "$pub" | tr -d '\n')\"" distribution-build/installer/install.sh
-          grep -qx 'MIN_VERSION="v0.0.0"' distribution-build/installer/install.sh
           # A publish without the Bunny storage password is refused before anything is built
           # or uploaded (no R2 credentials exist here, so reaching R2 would fail differently).
           refuses "BUNNY_STORAGE_PASSWORD is not set" env -u BUNNY_STORAGE_PASSWORD RELEASE_SIGNING_KEY="$(cat "$key")" \
@@ -113,13 +118,19 @@ jobs:
           refuses "is not a Bunny storage-zone password" env BUNNY_STORAGE_PASSWORD='a"b' RELEASE_SIGNING_KEY="$(cat "$key")" \
             EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 scripts/publish-dist.sh staging
           # The password reaches curl on stdin, never in argv (visible in /proc to every
-          # process on the runner). A curl shim prints its argv; the password must not be in it.
+          # process on the runner). A curl shim prints its argv and captures its stdin; the
+          # password must not be in the former and must be exactly the config line in the
+          # latter — a regression that stops sending the header (e.g. drops it from the -K
+          # config) would still hide the password from argv, so that alone doesn't prove the
+          # header reaches curl.
           bunny="$(sed -n '/^bunny_curl() {$/,/^}$/p' scripts/publish-dist.sh)"
           test -n "$bunny"
-          argv="$(bash -c 'set -euo pipefail; eval "$1"; curl() { printf "%s\n" "$@"; cat >/dev/null; }
-                  BUNNY_STORAGE_PASSWORD=SECRET-0123 bunny_curl -X PUT https://example.invalid/z/f' _ "$bunny")"
+          cfg="$(mktemp)"
+          argv="$(bash -c 'set -euo pipefail; eval "$1"; cfg="$2"; curl() { printf "%s\n" "$@"; cat > "$cfg"; }
+                  BUNNY_STORAGE_PASSWORD=SECRET-0123 bunny_curl -X PUT https://example.invalid/z/f' _ "$bunny" "$cfg")"
           if grep -q 'SECRET-0123' <<<"$argv"; then echo "FAIL: the Bunny password is in curl's argv"; exit 1; fi
           grep -qx -- '-K' <<<"$argv"
+          grep -qx 'header = "AccessKey: SECRET-0123"' "$cfg"
           # --preflight must refuse a missing Bunny password before its R2 probe runs, not
           # after: unset the R2 credentials too, so a wrong ordering surfaces as the R2
           # message instead of a false pass.
