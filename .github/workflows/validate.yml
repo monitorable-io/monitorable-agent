@@ -47,7 +47,9 @@ jobs:
           openssl dgst -sha256 -verify "$pub" -signature "$b/SHA256SUMS.sig" "$b/SHA256SUMS"
           head -n 1 "$b/SHA256SUMS" | grep -qx '# version v0.0.0'
           test "$(grep -c '^# version ' "$b/SHA256SUMS")" -eq 1
-          ! grep -q '@@' distribution-build/install.sh
+          if grep -q '@@' distribution-build/install.sh; then
+            echo "FAIL: unrendered placeholder in install.sh"; exit 1
+          fi
           grep -qF "SIGNING_PUBKEY=\"$(grep -v -- '-----' "$pub" | tr -d '\n')\"" distribution-build/install.sh
           grep -qx 'MIN_VERSION="v0.0.0"' distribution-build/install.sh
           # A key that does not match the expected public key is refused before any build.
