@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Build Monitorable agent binaries, render install.sh for the target env, and publish
-# the full distribution (install.sh + configs + binaries) to that env's R2 bucket.
+# Build Monitorable agent binaries, render install.sh for the target env, publish the full
+# distribution (install.sh + configs + binaries) to that env's R2 bucket, and upload the
+# rendered installer to that env's Bunny installer zone.
 #
 # Usage: scripts/publish-dist.sh <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]
-#   --render-only     : build + render into ./distribution-build, skip R2 upload
-#                       (CI dry-run / local test; no Cloudflare creds needed).
+#   --render-only     : build + render into ./distribution-build, skip R2/Bunny upload
+#                       (CI dry-run / local test; no Cloudflare or Bunny creds needed).
 #   --prune-only      : enforce R2 retention only (delete old versioned binaries), no build/publish
-#   --preflight       : prove the credentials can write this env's bucket (put + delete one
-#                       tiny object) and exit; no build. The release jobs run this first.
-#   --check-installer : check whether this env's backend already serves an installer that
-#                       embeds this env's signing key (gates STUB_INSTALLER); no build, no key.
+#   --preflight       : prove the credentials can write this env's R2 bucket AND its Bunny
+#                       installer zone (put + delete one tiny object in each) and exit; no
+#                       build. The release jobs run this first.
+#   --check-installer : check whether this env's installer host already serves an installer
+#                       that embeds this env's signing key (gates STUB_INSTALLER); no build, no key.
 #
 # VERSION (env) must be a plain release tag vX.Y.Z for a build (the release job passes the
 # pushed tag); --preflight, --prune-only and --check-installer do not use it.
@@ -21,6 +23,8 @@
 # so no second secret exists. Bucket-scoped tokens are exactly what the Cloudflare REST
 # API (wrangler) does NOT accept — it needs the account-wide "Admin Read & Write" — which
 # is why this script does not use wrangler (2026-09-22).
+# BUNNY_STORAGE_PASSWORD = the storage-zone password of this env's installer zone (write
+# access to that zone only).
 set -euo pipefail
 
 ENV="${1:-}"
@@ -34,9 +38,11 @@ VERSION="${VERSION:-dev}"
 # The dashboard's token page lists the endpoints its buckets need.
 case "$ENV" in
   staging) BASE_URL="https://get-mon.ok9k.com"; BUCKET="monitorable-get-staging"; R2_JURISDICTION="${R2_JURISDICTION-}"
-           INSTALLER_URL="${INSTALLER_URL:-https://install-mon.ok9k.com}"; STUB_INSTALLER="${STUB_INSTALLER:-0}" ;;
+           INSTALLER_URL="${INSTALLER_URL:-https://install-mon.ok9k.com}"; STUB_INSTALLER="${STUB_INSTALLER:-0}"
+           BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-staging}" ;;
   prod)    BASE_URL="https://get.monitorable.io"; BUCKET="monitorable-get-prod";   R2_JURISDICTION="${R2_JURISDICTION-eu}"
-           INSTALLER_URL="${INSTALLER_URL:-https://get.monitorable.net}"; STUB_INSTALLER="${STUB_INSTALLER:-0}" ;;
+           INSTALLER_URL="${INSTALLER_URL:-https://get.monitorable.net}"; STUB_INSTALLER="${STUB_INSTALLER:-0}"
+           BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-prod}" ;;
   *) echo "usage: $0 <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]" >&2; exit 1 ;;
 esac
 
@@ -81,7 +87,64 @@ s3() { aws --endpoint-url "$S3_ENDPOINT" "$@"; }
 # real one (auth, network), never "already gone".
 r2_delete() { s3 s3api delete-object --bucket "$BUCKET" --key "$1" >/dev/null; }
 
+# --- Bunny Storage: the installer host's origin (spec 2026-09-26-installer-signing-design.md
+# D2/D8). The storage-zone password can write that one zone and nothing else; the account API
+# key never comes near CI. It reaches curl through a config on stdin (-K -), never argv,
+# which every process on the runner can read. Bunny passwords are hyphenated hex; anything
+# else is refused, which also keeps it from breaking out of the quoted config value.
+bunny_require_password() {
+  if [ -z "${BUNNY_STORAGE_PASSWORD:-}" ]; then
+    echo "ERROR: BUNNY_STORAGE_PASSWORD is not set: the installer host cannot be published" >&2; exit 1
+  fi
+  if ! [[ "$BUNNY_STORAGE_PASSWORD" =~ ^[A-Za-z0-9-]+$ ]]; then
+    echo "ERROR: BUNNY_STORAGE_PASSWORD is not a Bunny storage-zone password (length ${#BUNNY_STORAGE_PASSWORD})" >&2; exit 1
+  fi
+}
+# bunny_curl <curl args...>: the header line must stay exactly `bunny_curl() {`, because
+# validate.yml extracts the function by that line to test that the password never reaches argv.
+# Never add -L here: curl forwards the AccessKey config across a redirect to another host.
+# Never add -v/--trace either: both print the header line, AccessKey included, to output.
+bunny_curl() {
+  printf 'header = "AccessKey: %s"\n' "$BUNNY_STORAGE_PASSWORD" \
+    | curl --proto '=https' --tlsv1.2 -fsS -K - "$@"
+}
+bunny_url() { printf 'https://%s/%s/%s' "$BUNNY_STORAGE_HOST" "$BUNNY_STORAGE_ZONE" "$1"; }
+
+PUT_ATTEMPTS="${PUT_ATTEMPTS:-5}"
+# with_retries <label> <command...>: each upload is retried (a transient error on ONE object
+# was seen on the v1.2.0 release), which is safe because overwriting an object is idempotent.
+with_retries() {
+  local label="$1" attempt=1
+  shift
+  while :; do
+    if "$@"; then return 0; fi
+    if [ "$attempt" -ge "$PUT_ATTEMPTS" ]; then
+      echo "ERROR: put $label failed after $attempt attempt(s)" >&2
+      return 1
+    fi
+    echo "put $label: attempt $attempt failed; retrying in $((attempt * 5))s" >&2
+    sleep "$((attempt * 5))"
+    attempt=$((attempt + 1))
+  done
+}
+put() { # localpath key content-type
+  with_retries "$2" s3 s3 cp "$1" "s3://${BUCKET}/$2" --content-type "$3" --no-progress
+}
+# bunny_put: Bunny checks the uppercase-hex SHA256 in the Checksum header and rejects a
+# corrupted upload instead of storing it.
+bunny_put() { # localpath name
+  local sum
+  sum="$(sha256sum "$1" | cut -d' ' -f1 | tr 'a-f' 'A-F')"
+  with_retries "bunny:$2" bunny_curl -o /dev/null -T "$1" \
+    -H "Checksum: $sum" -H "Content-Type: text/x-shellscript" "$(bunny_url "$2")"
+}
+
 if [ "$MODE" = "--preflight" ]; then
+  bunny_require_password
+  # As with RELEASE_SIGNING_KEY below: unexport once validated, so go build, aws, openssl,
+  # python3 and curl never inherit it through the environment. bunny_curl still reads it —
+  # it runs as a function in this shell, not a child process.
+  export -n BUNNY_STORAGE_PASSWORD
   r2_auth
   printf 'preflight %s %s\n' "$ENV" "$(date -u +%FT%TZ)" > "${TMPDIR:-/tmp}/r2-preflight.txt"
   if ! s3 s3 cp "${TMPDIR:-/tmp}/r2-preflight.txt" "s3://${BUCKET}/.preflight" --content-type text/plain --no-progress; then
@@ -89,7 +152,12 @@ if [ "$MODE" = "--preflight" ]; then
     exit 1
   fi
   r2_delete ".preflight" || echo "note: could not delete ${BUCKET}/.preflight (harmless)"
-  echo "preflight OK: credentials can write ${BUCKET}"; exit 0
+  if ! bunny_put "${TMPDIR:-/tmp}/r2-preflight.txt" ".preflight"; then
+    echo "ERROR: BUNNY_STORAGE_PASSWORD cannot write zone ${BUNNY_STORAGE_ZONE} on ${BUNNY_STORAGE_HOST}: check the zone name, its region host and the password" >&2
+    exit 1
+  fi
+  bunny_curl -o /dev/null -X DELETE "$(bunny_url .preflight)" || echo "note: could not delete ${BUNNY_STORAGE_ZONE}/.preflight (harmless)"
+  echo "preflight OK: credentials can write ${BUCKET} and Bunny zone ${BUNNY_STORAGE_ZONE}"; exit 0
 fi
 
 # --- Retention: keep latest/ + the N newest vX.Y.Z versions on R2 (best-effort) ---
@@ -134,8 +202,9 @@ EXPECTED_PUBKEY_FILE="${EXPECTED_PUBKEY_FILE:-$SRC/keys/${ENV}.pub}"
 pem_body() { grep -v -- '-----' | tr -d '\n'; }
 PUBKEY_LINE="$(pem_body < "$EXPECTED_PUBKEY_FILE")"
 
-# installer_serves_key: true when this env's backend serves an installer that embeds THIS
-# env's key. Gates the stub, so R2 never loses the real installer before the backend has it.
+# installer_serves_key: true when this env's installer host serves an installer that embeds
+# THIS env's key. Gates the stub, so R2 never loses the real installer before the installer
+# host has it.
 # The body is fetched completely before it is matched, and the matcher reads ALL of its
 # input (grep -c, never -q): under pipefail, a reader that stops at the first match kills
 # its writer with SIGPIPE once the rest of the body outgrows the pipe buffer, and the
@@ -173,14 +242,26 @@ unset RELEASE_SIGNING_KEY
 if [ "$(openssl pkey -in "$SIGNING_KEY_FILE" -pubout 2>/dev/null | pem_body)" != "$PUBKEY_LINE" ]; then
   echo "ERROR: RELEASE_SIGNING_KEY does not match $EXPECTED_PUBKEY_FILE — refusing to sign" >&2; exit 1
 fi
+# A publish needs the Bunny password too; find out now, not after the R2 upload.
+if [ "$MODE" != "--render-only" ]; then
+  bunny_require_password
+  # As with RELEASE_SIGNING_KEY above: unexport once validated, so go build, aws, openssl,
+  # python3 and curl never inherit it through the environment. bunny_curl still reads it —
+  # it runs as a function in this shell, not a child process.
+  export -n BUNNY_STORAGE_PASSWORD
+fi
 
 rm -rf "$OUT"
 mkdir -p "$OUT/configs" "$BINOUT"
 
-# 1. Render the object served at <bucket>/install.sh. Until this env's backend serves the
-# installer, that is the real installer with all three values filled (it verifies
-# signatures but is anchored in this bucket). Afterwards (STUB_INSTALLER=1) it is the stub,
-# and only if the backend demonstrably serves an installer carrying THIS env's key.
+# 1. Render the installer. $OUT/installer/install.sh is the real installer with all three
+# values filled; it is what the installer host (Bunny) serves. $OUT/install.sh is the object
+# at <bucket>/install.sh: the same installer until the stub cutover (it verifies signatures
+# but is anchored in this bucket), then (STUB_INSTALLER=1) the stub, and only if the
+# installer host demonstrably serves an installer carrying THIS env's key.
+mkdir -p "$OUT/installer"
+sed -e "s|@@BASE_URL@@|$BASE_URL|g" -e "s|@@SIGNING_PUBKEY@@|$PUBKEY_LINE|g" -e "s|@@MIN_VERSION@@|$VERSION|g" \
+  "$SRC/install.sh" > "$OUT/installer/install.sh"
 if [ "$STUB_INSTALLER" = 1 ]; then
   if ! installer_serves_key; then
     echo "ERROR: $INSTALLER_URL/install.sh is not live with this env's signing key — refusing to publish the stub" >&2
@@ -188,11 +269,10 @@ if [ "$STUB_INSTALLER" = 1 ]; then
   fi
   sed "s|@@INSTALLER_URL@@|$INSTALLER_URL|g" "$SRC/install-stub.sh" > "$OUT/install.sh"
 else
-  sed -e "s|@@BASE_URL@@|$BASE_URL|g" -e "s|@@SIGNING_PUBKEY@@|$PUBKEY_LINE|g" -e "s|@@MIN_VERSION@@|$VERSION|g" \
-    "$SRC/install.sh" > "$OUT/install.sh"
+  cp "$OUT/installer/install.sh" "$OUT/install.sh"
 fi
-chmod +x "$OUT/install.sh"
-if grep -q '@@' "$OUT/install.sh"; then
+chmod +x "$OUT/install.sh" "$OUT/installer/install.sh"
+if grep -q '@@' "$OUT/install.sh" "$OUT/installer/install.sh"; then
   echo "ERROR: an unrendered placeholder remains in install.sh" >&2; exit 1
 fi
 
@@ -247,28 +327,9 @@ fi
 
 # 4. Publish to the REAL bucket.
 r2_auth
-# Each put is retried: a transient Cloudflare error on ONE object (seen on the v1.2.0
-# release, on the last object) would otherwise abort the run and leave a partial surface
-# — new binaries under a stale SHA256SUMS, or vice versa — until someone re-runs the job.
-# Overwriting an R2 object is idempotent, so a retry after a half-applied put is safe.
-PUT_ATTEMPTS="${PUT_ATTEMPTS:-5}"
-put() { # localpath key content-type
-  local attempt=1
-  while :; do
-    if s3 s3 cp "$1" "s3://${BUCKET}/$2" --content-type "$3" --no-progress; then
-      return 0
-    fi
-    if [ "$attempt" -ge "$PUT_ATTEMPTS" ]; then
-      echo "ERROR: put $2 failed after $attempt attempt(s)" >&2
-      return 1
-    fi
-    echo "put $2: attempt $attempt failed; retrying in $((attempt * 5))s" >&2
-    sleep "$((attempt * 5))"
-    attempt=$((attempt + 1))
-  done
-}
 
-# Publish order is binaries → configs → SHA256SUMS.sig → SHA256SUMS → install.sh.
+# Publish order is binaries → configs → SHA256SUMS.sig → SHA256SUMS → install.sh (R2) →
+# latest.json → install.sh (Bunny).
 # install.sh verifies the binary, the config AND the unit against the one SHA256SUMS, so any
 # install that races this publish FAILS CLOSED — a new config or binary against the old
 # sums (or the reverse) aborts before anything is touched, and the operator retries. The
@@ -278,7 +339,8 @@ put() { # localpath key content-type
 # distribution/README.md. install.sh goes after the sums: the new installer's MIN_VERSION is
 # this release, so it must not go live before the signed sums that satisfy it (it would
 # refuse every install for the whole upload, and for good if a later put failed), while the
-# old installer, with its lower floor, accepts the new sums.
+# old installer, with its lower floor, accepts the new sums. install.sh (Bunny) goes last of
+# all, after latest.json: see 4b' below.
 # (Fail loud if the build produced no binaries, rather than uploading a literal glob.)
 shopt -s nullglob
 bins=("$BINOUT"/monitorable-agent-linux-*)
@@ -315,40 +377,49 @@ put "$OUT/install.sh" "install.sh" "text/x-shellscript"
 printf '{"version":"%s"}\n' "$VERSION" > "$OUT/latest.json"
 put "$OUT/latest.json" "latest.json" "application/json"
 
-echo "published ${ENV} distribution to ${BUCKET}"
+# 4b'. The installer host (Bunny) gets the real installer LAST: its MIN_VERSION is this
+# release, so it must not go live before the signed sums that satisfy it. If this put fails,
+# the previous installer (lower floor) stays live and accepts the new sums; the job fails and
+# a re-run finishes it.
+bunny_put "$OUT/installer/install.sh" "install.sh"
+
+echo "published ${ENV} distribution to ${BUCKET} and installer to Bunny zone ${BUNNY_STORAGE_ZONE}"
 
 # 4c. Verify the SERVED surface against what was just built: every object install.sh
 # downloads (versioned + latest/ binaries, configs, both SHA256SUMS), plus install.sh and
-# latest.json, fetched through the public base URL and compared byte-for-byte. A put
-# that "succeeded" but served something else, or a stale edge cache, fails the job here
-# rather than on a customer's host. Objects can take a moment to propagate, so mismatches
-# are retried for a bounded window before they count.
+# latest.json on the R2 base URL, PLUS install.sh on the installer host (Bunny), all
+# fetched over https and compared byte-for-byte. A put that "succeeded" but served
+# something else, or a stale edge cache, fails the job here rather than on a customer's
+# host — a Bunny pull zone that has cached the previous script fails this check for as
+# long as it keeps serving the stale copy. Objects can take a moment to propagate, so
+# mismatches are retried for a bounded window before they count.
 verify_published() {
   local vdir="$OUT/verify" key local_path tries
   rm -rf "$vdir"; mkdir -p "$vdir"
-  # key → local file it must match
+  # url → local file it must match
   local pairs=(
-    "install.sh=$OUT/install.sh"
-    "binaries/otel/${VERSION}/SHA256SUMS=$BINOUT/SHA256SUMS"
-    "binaries/otel/latest/SHA256SUMS=$BINOUT/SHA256SUMS"
-    "binaries/otel/${VERSION}/SHA256SUMS.sig=$BINOUT/SHA256SUMS.sig"
-    "binaries/otel/latest/SHA256SUMS.sig=$BINOUT/SHA256SUMS.sig"
-    "configs/linux/collector-config.yaml=$OUT/configs/linux/collector-config.yaml"
-    "configs/linux/monitorable-agent.service=$OUT/configs/linux/monitorable-agent.service"
+    "$BASE_URL/install.sh=$OUT/install.sh"
+    "$BASE_URL/binaries/otel/${VERSION}/SHA256SUMS=$BINOUT/SHA256SUMS"
+    "$BASE_URL/binaries/otel/latest/SHA256SUMS=$BINOUT/SHA256SUMS"
+    "$BASE_URL/binaries/otel/${VERSION}/SHA256SUMS.sig=$BINOUT/SHA256SUMS.sig"
+    "$BASE_URL/binaries/otel/latest/SHA256SUMS.sig=$BINOUT/SHA256SUMS.sig"
+    "$BASE_URL/configs/linux/collector-config.yaml=$OUT/configs/linux/collector-config.yaml"
+    "$BASE_URL/configs/linux/monitorable-agent.service=$OUT/configs/linux/monitorable-agent.service"
   )
   local f
   for f in "${bins[@]}"; do
-    pairs+=("binaries/otel/${VERSION}/$(basename "$f")=$f" "binaries/otel/latest/$(basename "$f")=$f")
+    pairs+=("$BASE_URL/binaries/otel/${VERSION}/$(basename "$f")=$f" "$BASE_URL/binaries/otel/latest/$(basename "$f")=$f")
   done
-  pairs+=("latest.json=$OUT/latest.json")
+  pairs+=("$BASE_URL/latest.json=$OUT/latest.json")
+  pairs+=("$INSTALLER_URL/install.sh=$OUT/installer/install.sh")
   local pair
   for pair in "${pairs[@]}"; do
     key="${pair%%=*}"; local_path="${pair#*=}"
     tries=0
-    until curl -fsSL --retry 3 -o "$vdir/obj" "$BASE_URL/$key" && cmp -s "$vdir/obj" "$local_path"; do
+    until curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$vdir/obj" "$key" && cmp -s "$vdir/obj" "$local_path"; do
       tries=$((tries + 1))
       if [ "$tries" -ge 12 ]; then
-        echo "ERROR: served $BASE_URL/$key does not match the published $local_path (after ${tries} tries)" >&2
+        echo "ERROR: served $key does not match the published $local_path (after ${tries} tries)" >&2
         return 1
       fi
       sleep 10
@@ -365,7 +436,7 @@ verify_published() {
   rm -rf "$vdir"
 }
 verify_published
-echo "verified ${ENV} surface at ${BASE_URL}"
+echo "verified ${ENV} surface at ${BASE_URL} and ${INSTALLER_URL}"
 
 # 5. Enforce retention: keep latest/ + the newest KEEP_VERSIONS versions on R2.
 prune_old_r2_versions || echo "retention prune skipped (non-fatal)"

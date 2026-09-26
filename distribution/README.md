@@ -14,8 +14,8 @@ Version-controlled source for the Monitorable agent distribution served at the
 - `install.sh` — Linux installer template with three placeholders: `@@BASE_URL@@` (the
   env's download host), `@@SIGNING_PUBKEY@@` (the env's release-signing public key, one
   line of base64 DER) and `@@MIN_VERSION@@` (the oldest release it accepts as `latest`).
-  The backend fills the first two when it serves the script and the third when it vendors
-  it; for the transitional copy on R2, `scripts/publish-dist.sh` fills all three
+  `scripts/publish-dist.sh` fills all three when it renders the installer for the
+  installer host (Bunny), and the same way for R2's transitional copy
   (`MIN_VERSION` = the release being published). A copy with any placeholder left refuses
   to run. The API key comes from
   `MONITORABLE_API_KEY` in the environment (preferred — an argv value is world-readable in
@@ -63,11 +63,13 @@ binary: it is sed-rendered into `/etc/systemd/system` and `daemon-reload`ed, so 
 unverified one is an arbitrary `ExecStart=`.
 
 `publish-dist.sh` uploads binaries → configs → `SHA256SUMS.sig` → `SHA256SUMS` →
-`install.sh` (then `latest.json`). The sums follow every payload they cover, so an install
-racing a publish fails closed rather than installing new checksums over old payloads.
-`install.sh` follows the sums because its `MIN_VERSION` is the new release: published
-first, it would refuse every install until the new signed sums arrived, whereas the old
-installer, with its lower floor, accepts them.
+`install.sh` (R2) → `latest.json` → `install.sh` (Bunny, the installer host). The sums
+follow every payload they cover, so an install racing a publish fails closed rather than
+installing new checksums over old payloads. `install.sh` follows the sums because its
+`MIN_VERSION` is the new release: published first, it would refuse every install until the
+new signed sums arrived, whereas the old installer, with its lower floor, accepts them. The
+installer host's copy goes last of all, for the same reason: it must not go live with a
+`MIN_VERSION` the just-published sums don't satisfy yet.
 
 Around that check:
 
@@ -88,28 +90,34 @@ Around that check:
 environments (and an offline backup). The public keys are committed at `distribution/keys/`.
 The script verifies the signature, then requires the signed version to be ≥ its
 `MIN_VERSION` (or to equal `--version=`), then checks every file against the authenticated
-sums. The trust anchor is wherever `install.sh` itself comes from. Fetched from the
-Monitorable backend (`https://get.monitorable.net/install.sh`, staging
-`https://install-mon.ok9k.com/install.sh`), which embeds the public key, writing this
-download bucket is not enough to get code onto a host: that needs the signing key too.
-During the transition the copy at `<get host>/install.sh` on R2 verifies signatures the
-same way but is itself anchored in the bucket — whoever can write the bucket can replace
-it — until the backend serves the installer and that object is replaced by a stub that
-points at the backend (`STUB_INSTALLER=1`). Verify a release yourself:
+sums. The trust anchor is wherever `install.sh` itself comes from. It is served from the
+installer host — `https://get.monitorable.net/install.sh` in prod,
+`https://install-mon.ok9k.com/install.sh` in staging — a Bunny Storage zone behind a Bunny
+CDN pull zone, not cached, with write access held only by that env's
+`BUNNY_STORAGE_PASSWORD` (a storage-zone password, scoped to that one zone; the Bunny
+account API key never reaches CI). `publish-dist.sh` uploads the rendered installer there
+**last**, after every other object, once the signed sums it depends on are already live.
+Writing the R2 download bucket is not enough to get code onto a host: that needs the
+installer host, and the signing key, too. During the transition the copy at `<get
+host>/install.sh` on R2 verifies signatures the same way but is itself anchored in the
+bucket — whoever can write the bucket can replace it — until it is replaced by a stub that
+points at the installer host (`STUB_INSTALLER=1`). Verify a release yourself:
 `openssl dgst -sha256 -verify distribution/keys/prod.pub -signature SHA256SUMS.sig SHA256SUMS`.
 Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the platform repo.
 
 ## Publishing
 
 ```bash
-scripts/publish-dist.sh staging --preflight      # prove the credentials can write the bucket (put+delete one object)
-scripts/publish-dist.sh staging                  # build + render + upload to R2
+scripts/publish-dist.sh staging --preflight      # prove the credentials can write the R2 bucket AND the Bunny zone (put+delete one object in each)
+scripts/publish-dist.sh staging                  # build + render + upload to R2, then the installer to the Bunny installer host
 scripts/publish-dist.sh staging --render-only    # build + render into ./distribution-build, no upload
-scripts/publish-dist.sh staging --check-installer  # does the backend serve an installer with this env's key? (gates STUB_INSTALLER=1)
+scripts/publish-dist.sh staging --check-installer  # does this env's installer host serve an installer with this env's key? (gates STUB_INSTALLER=1)
 ```
 
 A build needs `VERSION=vX.Y.Z` (the release job passes the pushed tag; anything else is
-refused before signing) and `RELEASE_SIGNING_KEY`, which must match `distribution/keys/<env>.pub`.
+refused before signing) and `RELEASE_SIGNING_KEY`, which must match
+`distribution/keys/<env>.pub`. A publish or `--preflight` also needs
+`BUNNY_STORAGE_PASSWORD` (not `--render-only`, which never uploads).
 
 Uploads go over R2's **S3 API** with the AWS CLI (preinstalled on GitHub runners). The
 credentials are `CLOUDFLARE_R2_TOKEN` — an R2 API token with **Object Read & Write**
