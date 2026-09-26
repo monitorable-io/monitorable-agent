@@ -98,15 +98,29 @@ jobs:
                  { head -c 40000 /dev/zero | tr "\0" x; printf "\nSIGNING_PUBKEY=\"OTHERKEY\"\n"; head -c 400000 /dev/zero | tr "\0" y; } | installer_body_has_key' _ "$matcher"; then
             echo "FAIL: the installer-key matcher accepted a body without the key"; exit 1
           fi
-          # Stub preflight: a URL that answers 200 with a DIFFERENT key (this commit's own
-          # template, whose key is the placeholder) must not get the stub. The URL must be
-          # reachable first, so the refusal is about the key.
+          # Stub render (since v1.3.2 STUB_INSTALLER defaults to 1): there is no pre-render
+          # gate any more, so this must SUCCEED even against an installer host that is
+          # unreachable / on a different key — only the later PUBLISH of R2's install.sh is
+          # order-gated on verify_published (the order test below), not the render.
+          STUB_INSTALLER=1 INSTALLER_URL=https://installer.example RELEASE_SIGNING_KEY="$(cat "$key")" \
+            EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 scripts/publish-dist.sh staging --render-only
+          grep -qF 'The Monitorable installer has moved' distribution-build/install.sh
+          grep -qF 'https://installer.example/install.sh' distribution-build/install.sh
+          if grep -q '@@' distribution-build/install.sh; then
+            echo "FAIL: unrendered placeholder in the stub"; exit 1
+          fi
+          if grep -q 'SIGNING_PUBKEY=' distribution-build/install.sh; then
+            echo "FAIL: the stub embeds a signing-key line"; exit 1
+          fi
+          # The installer host's copy is unaffected by stub mode: still the real, fully
+          # rendered installer, with this run's key and MIN_VERSION.
+          grep -qF "SIGNING_PUBKEY=\"$(grep -v -- '-----' "$pub" | tr -d '\n')\"" distribution-build/installer/install.sh
+          grep -qx 'MIN_VERSION="v0.0.0"' distribution-build/installer/install.sh
+          # --check-installer (the manual pre-cutover check) still refuses a host that answers
+          # 200 with a DIFFERENT key (this commit's own template, whose key is the
+          # placeholder). The URL must be reachable first, so the refusal is about the key.
           tpl="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/distribution"
           curl --proto '=https' -fsS -o /dev/null "$tpl/install.sh"
-          refuses "is not live with this env's signing key" env STUB_INSTALLER=1 INSTALLER_URL="$tpl" \
-            RELEASE_SIGNING_KEY="$(cat "$key")" EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
-            scripts/publish-dist.sh staging --render-only
-          # The same check on its own, without any private key or VERSION.
           refuses "is not live with this env's signing key" env -u RELEASE_SIGNING_KEY -u VERSION INSTALLER_URL="$tpl" \
             EXPECTED_PUBKEY_FILE="$pub" scripts/publish-dist.sh staging --check-installer
           # A publish without the Bunny storage password is refused before anything is built
@@ -136,6 +150,14 @@ jobs:
           # message instead of a false pass.
           refuses "BUNNY_STORAGE_PASSWORD is not set" env -u BUNNY_STORAGE_PASSWORD -u CLOUDFLARE_R2_TOKEN -u CLOUDFLARE_API_TOKEN \
             scripts/publish-dist.sh staging --preflight
+          # Order test: R2's install.sh (real or stub) is put exactly once, and only after
+          # verify_published has confirmed the installer host — a failed Bunny verification
+          # (under set -e, no `|| true`, not inside an `if`) must exit before that put runs.
+          # shellcheck disable=SC2016  # intentional: literal $OUT in the grep pattern, not shell expansion
+          put_line="$(grep -n '^put "\$OUT/install.sh" "install.sh"' scripts/publish-dist.sh | cut -d: -f1)"
+          verify_line="$(grep -n '^verify_published$' scripts/publish-dist.sh | cut -d: -f1)"
+          test "$(printf '%s\n' "$put_line" | grep -c .)" -eq 1   # exactly one R2 install.sh put
+          test "$put_line" -gt "$verify_line"
       - name: Cross-compile smoke (linux amd64+arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/agent-amd64 ./cmd/monitorable-agent

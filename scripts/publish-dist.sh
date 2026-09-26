@@ -11,7 +11,8 @@
 #                       installer zone (put + delete one tiny object in each) and exit; no
 #                       build. The release jobs run this first.
 #   --check-installer : check whether this env's installer host already serves an installer
-#                       that embeds this env's signing key (gates STUB_INSTALLER); no build, no key.
+#                       that embeds this env's signing key; a manual pre-cutover check (it no
+#                       longer gates STUB_INSTALLER — see distribution/README.md); no build, no key.
 #
 # VERSION (env) must be a plain release tag vX.Y.Z for a build (the release job passes the
 # pushed tag); --preflight, --prune-only and --check-installer do not use it.
@@ -36,12 +37,14 @@ VERSION="${VERSION:-dev}"
 # (<account>.<jurisdiction>.r2.cloudflarestorage.com); on the default endpoint it does
 # not exist for the token — R2 answers AccessDenied, not NoSuchBucket (prod, 2026-09-22).
 # The dashboard's token page lists the endpoints its buckets need.
+# since v1.3.2 both installer hosts serve install.sh; R2 carries the stub, put only after
+# this run verified the installer host
 case "$ENV" in
   staging) BASE_URL="https://get-mon.ok9k.com"; BUCKET="monitorable-get-staging"; R2_JURISDICTION="${R2_JURISDICTION-}"
-           INSTALLER_URL="${INSTALLER_URL:-https://install-mon.ok9k.com}"; STUB_INSTALLER="${STUB_INSTALLER:-0}"
+           INSTALLER_URL="${INSTALLER_URL:-https://install-mon.ok9k.com}"; STUB_INSTALLER="${STUB_INSTALLER:-1}"
            BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-staging}" ;;
   prod)    BASE_URL="https://get.monitorable.io"; BUCKET="monitorable-get-prod";   R2_JURISDICTION="${R2_JURISDICTION-eu}"
-           INSTALLER_URL="${INSTALLER_URL:-https://get.monitorable.net}"; STUB_INSTALLER="${STUB_INSTALLER:-0}"
+           INSTALLER_URL="${INSTALLER_URL:-https://get.monitorable.net}"; STUB_INSTALLER="${STUB_INSTALLER:-1}"
            BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-prod}" ;;
   *) echo "usage: $0 <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]" >&2; exit 1 ;;
 esac
@@ -203,8 +206,9 @@ pem_body() { grep -v -- '-----' | tr -d '\n'; }
 PUBKEY_LINE="$(pem_body < "$EXPECTED_PUBKEY_FILE")"
 
 # installer_serves_key: true when this env's installer host serves an installer that embeds
-# THIS env's key. Gates the stub, so R2 never loses the real installer before the installer
-# host has it.
+# THIS env's key. Used by --check-installer, a manual pre-cutover check — it no longer gates
+# the stub render; see step 4d below for how R2 still never loses the real installer before
+# the installer host has it.
 # The body is fetched completely before it is matched, and the matcher reads ALL of its
 # input (grep -c, never -q): under pipefail, a reader that stops at the first match kills
 # its writer with SIGPIPE once the rest of the body outgrows the pipe buffer, and the
@@ -256,17 +260,15 @@ mkdir -p "$OUT/configs" "$BINOUT"
 
 # 1. Render the installer. $OUT/installer/install.sh is the real installer with all three
 # values filled; it is what the installer host (Bunny) serves. $OUT/install.sh is the object
-# at <bucket>/install.sh: the same installer until the stub cutover (it verifies signatures
-# but is anchored in this bucket), then (STUB_INSTALLER=1) the stub, and only if the
-# installer host demonstrably serves an installer carrying THIS env's key.
+# that becomes <bucket>/install.sh: the stub (STUB_INSTALLER=1) or the real installer
+# (STUB_INSTALLER=0). The stub is rendered here unconditionally — there is no pre-render
+# gate any more — but it is only PUBLISHED after this run has verified the installer host
+# serves this run's installer (step 4d, after verify_published), so R2 never loses the real
+# installer unless the host demonstrably serves it first.
 mkdir -p "$OUT/installer"
 sed -e "s|@@BASE_URL@@|$BASE_URL|g" -e "s|@@SIGNING_PUBKEY@@|$PUBKEY_LINE|g" -e "s|@@MIN_VERSION@@|$VERSION|g" \
   "$SRC/install.sh" > "$OUT/installer/install.sh"
 if [ "$STUB_INSTALLER" = 1 ]; then
-  if ! installer_serves_key; then
-    echo "ERROR: $INSTALLER_URL/install.sh is not live with this env's signing key — refusing to publish the stub" >&2
-    exit 1
-  fi
   sed "s|@@INSTALLER_URL@@|$INSTALLER_URL|g" "$SRC/install-stub.sh" > "$OUT/install.sh"
 else
   cp "$OUT/installer/install.sh" "$OUT/install.sh"
@@ -328,19 +330,20 @@ fi
 # 4. Publish to the REAL bucket.
 r2_auth
 
-# Publish order is binaries → configs → SHA256SUMS.sig → SHA256SUMS → install.sh (R2) →
-# latest.json → install.sh (Bunny).
+# Publish order is binaries → configs → SHA256SUMS.sig → SHA256SUMS → latest.json →
+# install.sh (Bunny) → verify_published → install.sh (R2, real or stub) → verify_served.
 # install.sh verifies the binary, the config AND the unit against the one SHA256SUMS, so any
 # install that races this publish FAILS CLOSED — a new config or binary against the old
 # sums (or the reverse) aborts before anything is touched, and the operator retries. The
 # window is the length of this upload, a few minutes. Sums after the payloads keeps that
 # window as short as possible and keeps the previous set installable for as much of it as
 # possible; it does not eliminate it. Signed, versioned config objects would; see
-# distribution/README.md. install.sh goes after the sums: the new installer's MIN_VERSION is
-# this release, so it must not go live before the signed sums that satisfy it (it would
-# refuse every install for the whole upload, and for good if a later put failed), while the
-# old installer, with its lower floor, accepts the new sums. install.sh (Bunny) goes last of
-# all, after latest.json: see 4b' below.
+# distribution/README.md. install.sh (Bunny) goes after the sums: the new installer's
+# MIN_VERSION is this release, so it must not go live before the signed sums that satisfy it
+# (it would refuse every install for the whole upload, and for good if a later put failed),
+# while the old installer, with its lower floor, accepts the new sums. R2's install.sh (real
+# or stub) goes dead last of all, after verify_published has confirmed the installer host:
+# see 4d below.
 # (Fail loud if the build produced no binaries, rather than uploading a literal glob.)
 shopt -s nullglob
 bins=("$BINOUT"/monitorable-agent-linux-*)
@@ -370,7 +373,6 @@ put "$BINOUT/SHA256SUMS.sig" "binaries/otel/${VERSION}/SHA256SUMS.sig" "applicat
 put "$BINOUT/SHA256SUMS.sig" "binaries/otel/latest/SHA256SUMS.sig"     "application/octet-stream"
 put "$BINOUT/SHA256SUMS" "binaries/otel/${VERSION}/SHA256SUMS" "text/plain"
 put "$BINOUT/SHA256SUMS" "binaries/otel/latest/SHA256SUMS"     "text/plain"
-put "$OUT/install.sh" "install.sh" "text/x-shellscript"
 
 # 4b. Version manifest — the backend reads this (GET /latest.json) to compare
 # each server's reported agent version against the newest published one.
@@ -386,19 +388,32 @@ bunny_put "$OUT/installer/install.sh" "install.sh"
 echo "published ${ENV} distribution to ${BUCKET} and installer to Bunny zone ${BUNNY_STORAGE_ZONE}"
 
 # 4c. Verify the SERVED surface against what was just built: every object install.sh
-# downloads (versioned + latest/ binaries, configs, both SHA256SUMS), plus install.sh and
-# latest.json on the R2 base URL, PLUS install.sh on the installer host (Bunny), all
-# fetched over https and compared byte-for-byte. A put that "succeeded" but served
-# something else, or a stale edge cache, fails the job here rather than on a customer's
-# host — a Bunny pull zone that has cached the previous script fails this check for as
-# long as it keeps serving the stale copy. Objects can take a moment to propagate, so
-# mismatches are retried for a bounded window before they count.
+# downloads (versioned + latest/ binaries, configs, both SHA256SUMS), plus latest.json on
+# the R2 base URL, PLUS install.sh on the installer host (Bunny), all fetched over https and
+# compared byte-for-byte. A put that "succeeded" but served something else, or a stale edge
+# cache, fails the job here rather than on a customer's host — a Bunny pull zone that has
+# cached the previous script fails this check for as long as it keeps serving the stale
+# copy. Objects can take a moment to propagate, so mismatches are retried for a bounded
+# window before they count. R2's own install.sh is checked separately, in 4d: it is not
+# uploaded yet at this point.
+VDIR="$OUT/verify"
+verify_served() { # url local_path
+  local url="$1" local_path="$2" tries=0
+  until curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$VDIR/obj" "$url" && cmp -s "$VDIR/obj" "$local_path"; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 12 ]; then
+      echo "ERROR: served $url does not match the published $local_path (after ${tries} tries)" >&2
+      return 1
+    fi
+    sleep 10
+  done
+  echo "verified $url"
+}
 verify_published() {
-  local vdir="$OUT/verify" key local_path tries
-  rm -rf "$vdir"; mkdir -p "$vdir"
+  local key local_path
+  rm -rf "$VDIR"; mkdir -p "$VDIR"
   # url → local file it must match
   local pairs=(
-    "$BASE_URL/install.sh=$OUT/install.sh"
     "$BASE_URL/binaries/otel/${VERSION}/SHA256SUMS=$BINOUT/SHA256SUMS"
     "$BASE_URL/binaries/otel/latest/SHA256SUMS=$BINOUT/SHA256SUMS"
     "$BASE_URL/binaries/otel/${VERSION}/SHA256SUMS.sig=$BINOUT/SHA256SUMS.sig"
@@ -415,27 +430,28 @@ verify_published() {
   local pair
   for pair in "${pairs[@]}"; do
     key="${pair%%=*}"; local_path="${pair#*=}"
-    tries=0
-    until curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$vdir/obj" "$key" && cmp -s "$vdir/obj" "$local_path"; do
-      tries=$((tries + 1))
-      if [ "$tries" -ge 12 ]; then
-        echo "ERROR: served $key does not match the published $local_path (after ${tries} tries)" >&2
-        return 1
-      fi
-      sleep 10
-    done
-    echo "verified $key"
+    verify_served "$key" "$local_path" || return 1
   done
-  curl -fsSL "$BASE_URL/binaries/otel/latest/SHA256SUMS" -o "$vdir/sums"
-  curl -fsSL "$BASE_URL/binaries/otel/latest/SHA256SUMS.sig" -o "$vdir/sig"
-  if ! openssl dgst -sha256 -verify "$EXPECTED_PUBKEY_FILE" -signature "$vdir/sig" "$vdir/sums" >/dev/null; then
+  curl -fsSL "$BASE_URL/binaries/otel/latest/SHA256SUMS" -o "$VDIR/sums"
+  curl -fsSL "$BASE_URL/binaries/otel/latest/SHA256SUMS.sig" -o "$VDIR/sig"
+  if ! openssl dgst -sha256 -verify "$EXPECTED_PUBKEY_FILE" -signature "$VDIR/sig" "$VDIR/sums" >/dev/null; then
     echo "ERROR: the served latest/SHA256SUMS does not verify with $EXPECTED_PUBKEY_FILE" >&2
     return 1
   fi
   echo "verified the served signature"
-  rm -rf "$vdir"
 }
 verify_published
+
+# 4d. R2's install.sh goes last of all, after the installer host was verified above: in stub
+# mode that is what keeps R2 from ever losing the real installer to a stub before the host
+# serves this run's installer — and, unlike a gate on the host's CURRENT key, it keeps a
+# key-rotation release working (the host only receives the new key from this same run).
+# In non-stub mode the real installer's MIN_VERSION is this release, so after the sums is
+# all it needs; last costs nothing.
+put "$OUT/install.sh" "install.sh" "text/x-shellscript"
+verify_served "$BASE_URL/install.sh" "$OUT/install.sh"
+
+rm -rf "$VDIR"
 echo "verified ${ENV} surface at ${BASE_URL} and ${INSTALLER_URL}"
 
 # 5. Enforce retention: keep latest/ + the newest KEEP_VERSIONS versions on R2.

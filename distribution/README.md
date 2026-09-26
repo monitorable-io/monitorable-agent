@@ -63,13 +63,13 @@ binary: it is sed-rendered into `/etc/systemd/system` and `daemon-reload`ed, so 
 unverified one is an arbitrary `ExecStart=`.
 
 `publish-dist.sh` uploads binaries → configs → `SHA256SUMS.sig` → `SHA256SUMS` →
-`install.sh` (R2) → `latest.json` → `install.sh` (Bunny, the installer host). The sums
-follow every payload they cover, so an install racing a publish fails closed rather than
-installing new checksums over old payloads. `install.sh` follows the sums because its
-`MIN_VERSION` is the new release: published first, it would refuse every install until the
-new signed sums arrived, whereas the old installer, with its lower floor, accepts them. The
-installer host's copy goes last of all, for the same reason: it must not go live with a
-`MIN_VERSION` the just-published sums don't satisfy yet.
+`latest.json` → `install.sh` (Bunny, the installer host) → verify → `install.sh` (R2, real
+or stub) → verify it. The sums follow every payload they cover, so an install racing a
+publish fails closed rather than installing new checksums over old payloads. The installer
+host's copy follows the sums because its `MIN_VERSION` is the new release: published first,
+it would refuse every install until the new signed sums arrived, whereas the old installer,
+with its lower floor, accepts them. R2's `install.sh` goes dead last of all, only after that
+publish has verified the installer host serves this run's installer — see below.
 
 Around that check:
 
@@ -98,10 +98,11 @@ CDN pull zone, not cached, with write access held only by that env's
 account API key never reaches CI). `publish-dist.sh` uploads the rendered installer there
 **last**, after every other object, once the signed sums it depends on are already live.
 Writing the R2 download bucket is not enough to get code onto a host: that needs the
-installer host, and the signing key, too. During the transition the copy at `<get
-host>/install.sh` on R2 verifies signatures the same way but is itself anchored in the
-bucket — whoever can write the bucket can replace it — until it is replaced by a stub that
-points at the installer host (`STUB_INSTALLER=1`). Verify a release yourself:
+installer host, and the signing key, too. Since v1.3.2 the copy at `<get host>/install.sh`
+on R2 is a stub (both envs) that just points at the installer host — `publish-dist.sh`
+publishes it only after that same run's publish has verified the installer host serves this
+run's installer (see "Publish order" above), so R2 never loses the real installer to a stub
+before the host demonstrably has it. Verify a release yourself:
 `openssl dgst -sha256 -verify distribution/keys/prod.pub -signature SHA256SUMS.sig SHA256SUMS`.
 Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the platform repo.
 
@@ -111,7 +112,7 @@ Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the p
 scripts/publish-dist.sh staging --preflight      # prove the credentials can write the R2 bucket AND the Bunny zone (put+delete one object in each)
 scripts/publish-dist.sh staging                  # build + render + upload to R2, then the installer to the Bunny installer host
 scripts/publish-dist.sh staging --render-only    # build + render into ./distribution-build, no upload
-scripts/publish-dist.sh staging --check-installer  # does this env's installer host serve an installer with this env's key? (gates STUB_INSTALLER=1)
+scripts/publish-dist.sh staging --check-installer  # manual pre-cutover check: does this env's installer host serve an installer with this env's key?
 ```
 
 A build needs `VERSION=vX.Y.Z` (the release job passes the pushed tag; anything else is
