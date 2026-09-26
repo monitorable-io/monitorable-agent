@@ -59,6 +59,19 @@ unverified one is an arbitrary `ExecStart=`.
 install racing a publish sees at worst the previous, self-consistent set rather than new
 checksums over old payloads.
 
+Around that check:
+
+- Nothing is touched before the preflights pass (root, Linux, amd64/arm64, `curl`,
+  `sha256sum`, a running systemd). A host without systemd is refused with zero side
+  effects.
+- With an `https://` base URL every download is `--proto =https --tlsv1.2`, so a redirect
+  cannot downgrade a transfer to cleartext. The dev `http://` origin keeps plain curl.
+- The output prints the verified binary's sha256. Each release's `SHA256SUMS` is also
+  attached to its GitHub release, so it can be checked against a second origin.
+- The service user, group and docker membership are created only after verification, so a
+  failed fresh install leaves no account behind (only the empty `/opt/monitorable` and
+  `/etc/monitorable` the downloads were staged in).
+
 What this protects: a truncated or corrupted transfer, and a CDN serving new checksums
 against stale payloads. What it does **not** protect: a compromise of the bucket or of the
 TLS channel — `SHA256SUMS` is unsigned and comes from the same origin as `install.sh`
