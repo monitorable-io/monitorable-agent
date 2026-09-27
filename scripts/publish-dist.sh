@@ -48,6 +48,12 @@ case "$ENV" in
            BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-prod}" ;;
   *) echo "usage: $0 <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]" >&2; exit 1 ;;
 esac
+# Only 0 and 1 mean anything: any other value (e.g. "true") would otherwise fall through
+# to the real installer on R2, silently undoing the stub cutover.
+case "$STUB_INSTALLER" in
+  0|1) ;;
+  *) echo "ERROR: STUB_INSTALLER must be 0 or 1 (got '$STUB_INSTALLER')" >&2; exit 1 ;;
+esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/distribution"
@@ -432,8 +438,12 @@ verify_published() {
     key="${pair%%=*}"; local_path="${pair#*=}"
     verify_served "$key" "$local_path" || return 1
   done
-  curl -fsSL "$BASE_URL/binaries/otel/latest/SHA256SUMS" -o "$VDIR/sums"
-  curl -fsSL "$BASE_URL/binaries/otel/latest/SHA256SUMS.sig" -o "$VDIR/sig"
+  # Same transport as verify_served: https-only, with retries for a transient edge error.
+  if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$VDIR/sums" "$BASE_URL/binaries/otel/latest/SHA256SUMS" ||
+     ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$VDIR/sig" "$BASE_URL/binaries/otel/latest/SHA256SUMS.sig"; then
+    echo "ERROR: could not fetch the served latest/SHA256SUMS(.sig) to verify the signature" >&2
+    return 1
+  fi
   if ! openssl dgst -sha256 -verify "$EXPECTED_PUBKEY_FILE" -signature "$VDIR/sig" "$VDIR/sums" >/dev/null; then
     echo "ERROR: the served latest/SHA256SUMS does not verify with $EXPECTED_PUBKEY_FILE" >&2
     return 1

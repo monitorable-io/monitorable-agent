@@ -206,6 +206,22 @@ rc=$(run_rc "sh /root/install-dupversion.sh --endpoint=$ENDPOINT --api-key=$KEY"
 check duplicate-version-line-refused '[ "$rc" = 1 ] && out_has "exactly one version line" && ! run "test -e /opt/monitorable/monitorable-agent"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
+# A signed version line with a CRLF ending (a sums file edited on Windows) is refused, never
+# read as v1.3.0: the \r makes it malformed, and a malformed version fails closed.
+run "sh /root/mirror-build.sh crlfversion crlf ok ok"
+render "$ORIGIN/crlfversion" /root/install-crlfversion.sh
+rc=$(run_rc "sh /root/install-crlfversion.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check crlf-version-line-refused '[ "$rc" = 1 ] && out_has "refusing" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# Leading zeros compare as decimal (never octal, never as text): v1.02.9 is below the
+# v1.3.0 floor and is refused.
+run "sh /root/mirror-build.sh zeroversion v1.02.9 ok ok"
+render "$ORIGIN/zeroversion" /root/install-zeroversion.sh
+rc=$(run_rc "sh /root/install-zeroversion.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check leading-zero-below-floor-refused '[ "$rc" = 1 ] && out_has "older than this installer" && ! run "test -e /opt/monitorable/monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
 # A stale download left in a pre-existing, non-root-owned /opt/monitorable is never reused:
 # curl -o would write into that inode (still owned by its planter, who could rewrite it
 # after verification) and the rename would install it. The installed binary must be a new,

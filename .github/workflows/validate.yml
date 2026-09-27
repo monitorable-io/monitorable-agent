@@ -82,6 +82,9 @@ jobs:
           # No key at all is refused.
           refuses "RELEASE_SIGNING_KEY is not set" env -u RELEASE_SIGNING_KEY EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 \
             scripts/publish-dist.sh staging --render-only
+          # A STUB_INSTALLER other than 0/1 is refused, never read as "not the stub".
+          refuses "STUB_INSTALLER must be 0 or 1" env STUB_INSTALLER=true RELEASE_SIGNING_KEY="$(cat "$key")" \
+            EXPECTED_PUBKEY_FILE="$pub" VERSION=v0.0.0 scripts/publish-dist.sh staging --render-only
           # A VERSION install.sh would never accept (a pre-release tag) is refused before
           # anything is signed: it would become MIN_VERSION and brick every latest install.
           refuses "VERSION must look like vX.Y.Z" env RELEASE_SIGNING_KEY="$(cat "$key")" EXPECTED_PUBKEY_FILE="$pub" \
