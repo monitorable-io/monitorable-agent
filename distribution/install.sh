@@ -816,6 +816,13 @@ rollback() {
     rb_step "restore the configuration" mv -f "$PREV_CONFIG" "$CONFIG_DIR/$CONFIG_FILE"
     rb_step "restore agent.env" mv -f "$PREV_ENV" "$AGENT_ENV"
     rb_step "restore the unit" mv -f "$PREV_UNIT" "/etc/systemd/system/$UNIT_FILE"
+    # On an SELinux host the snapshot took /etc/monitorable's label (etc_t) and mv keeps it;
+    # put back the policy default (systemd_unit_file_t). Hygiene, not a gate: under the
+    # targeted policy systemd loads the etc_t unit anyway, so a failure here is not a
+    # rollback failure. No restorecon (no SELinux) = nothing to fix.
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon "/etc/systemd/system/$UNIT_FILE" 2>/dev/null || true
+    fi
     rb_step "reload systemd" systemctl daemon-reload
     systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
     rb_step "restart the service" systemctl restart "$SERVICE_NAME"

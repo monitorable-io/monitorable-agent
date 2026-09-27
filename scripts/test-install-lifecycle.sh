@@ -215,6 +215,9 @@ rc=$(run_rc "sh /root/install-broken.sh --endpoint=https://ingest-mon.ok9k.com/"
 # The endpoint this run asked for is dropped with the rest of the new release, and the
 # output says so.
 check update-rolls-back '[ "$rc" = 1 ] && out_has "Saved the running agent for rollback" && out_has "restoring the previous agent" && out_has "previous agent is restored and running" && out_has "was not applied" && run "systemctl is-active --quiet monitorable-agent" && [ "$(state)" = "$BEFORE" ] && no_prev'
+# On an SELinux host the restored unit carries the policy's default type, not the etc_t it
+# picked up as a snapshot in /etc/monitorable. No SELinux (this Ubuntu container) = vacuous.
+check update-rolls-back-unit-label 'run "! command -v selinuxenabled >/dev/null 2>&1 || ! selinuxenabled || [ \"\$(stat -c %C /etc/systemd/system/monitorable-agent.service | cut -d: -f3)\" = \"\$(matchpathcon -n /etc/systemd/system/monitorable-agent.service | cut -d: -f3)\" ]"'
 
 # The unconditional clear fails (a directory where a snapshot file goes): exit 1 before any
 # rename, the old agent untouched.
