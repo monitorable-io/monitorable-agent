@@ -376,13 +376,20 @@ PREV_ENV="$AGENT_ENV.prev"
 PREV_UNIT="$CONFIG_DIR/$UNIT_FILE.prev"
 PREV_HEALTHY=0
 SNAPSHOT=0
-# agent_age_ok: 0 when the agent's main process has been up >= 10s. Both start times come
+# agent_process_ok: 0 when the agent's main process has been up >= 10s. Both start times come
 # from /proc/<pid>/stat (clock ticks since boot, field 22). Never /proc/uptime: lxcfs
 # virtualises it in LXC containers while systemd's timestamps stay on the host clock.
 # This shell ($$) started moments ago, so the difference is the agent's age.
-agent_age_ok() {
+# The process must also be running the binary on disk: a run killed after the binary
+# rename but before the restart leaves the OLD process running next to the NEW files, and
+# a snapshot of those files would not be what is running.
+agent_process_ok() {
     _pid="$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)" || return 1
     case "$_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+    # Same device and inode (test -ef is not POSIX); stat -L follows /proc/<pid>/exe to the
+    # running inode even when its file has been renamed away.
+    _exe_id="$(stat -L -c '%d:%i' "/proc/$_pid/exe" 2>/dev/null)" || return 1
+    [ -n "$_exe_id" ] && [ "$_exe_id" = "$(stat -c '%d:%i' "$INSTALL_DIR/$BINARY_NAME" 2>/dev/null)" ] || return 1
     # Strip "pid (comm) " first: comm may contain spaces or ")".
     _agent_start="$(sed 's/.*) //' "/proc/$_pid/stat" 2>/dev/null | cut -d' ' -f20)"
     _self_start="$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | cut -d' ' -f20)"
@@ -396,7 +403,7 @@ if [ -f "/etc/systemd/system/$UNIT_FILE" ] && [ ! -f "$LEGACY_UNIT" ] &&
     [ -f "$INSTALL_DIR/$BINARY_NAME" ] && [ -f "$CONFIG_DIR/$CONFIG_FILE" ] && [ -f "$AGENT_ENV" ] &&
     [ "$(systemctl show -p ActiveState --value "$SERVICE_NAME" 2>/dev/null)" = active ] &&
     [ "$(systemctl show -p SubState --value "$SERVICE_NAME" 2>/dev/null)" = running ] &&
-    agent_age_ok; then
+    agent_process_ok; then
     PREV_HEALTHY=1
 fi
 
@@ -749,17 +756,20 @@ rm -f "$INSTALL_DIR/monitorable-otelcol" "$INSTALL_DIR/monitorable-collector-run
 
 # Enable and start service
 printf '%b' "${YELLOW}▶️  Starting service...${NC}\n"
-systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
+# From here on the new files are live on disk. A systemd step that fails outright (a
+# failing ExecStartPre, a rejected unit, an enable that can't write its symlink) is an
+# update failure like one that doesn't stay up: it must reach the outcome below and its
+# rollback, not end the script under set -e with the old process still running next to
+# the new files and no logs.
+START_FAILED=0
+systemctl daemon-reload || START_FAILED=1
+systemctl enable "$SERVICE_NAME" || START_FAILED=1
 # Use restart, not start: on a re-run/upgrade the unit may already be active (or
 # crash-looping), and `start` is a no-op on an active unit — the new binary/config
 # would never load. reset-failed first clears any prior crash-loop counters so the
 # NRestarts check below reflects only this (re)start, not stale history.
 systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
-# A restart that fails outright (a failing ExecStartPre, a rejected unit) is the plainest
-# case of not staying up: it must reach the check below and its rollback, not end the
-# script here under set -e with the new release half-started and no logs.
-systemctl restart "$SERVICE_NAME" || true
+systemctl restart "$SERVICE_NAME" || START_FAILED=1
 
 # Verify the collector actually STAYS up. With Type=simple, systemd reports
 # "active" the instant ExecStart forks — before the process can fail (bad config,
@@ -795,6 +805,12 @@ rb_step() {
 # and check again. Always exits 1: the update failed either way.
 rollback() {
     RB_FAILED=0
+    # This run's key or endpoint (a flag, the environment) goes back with the rest of the
+    # new release. Say so — after a key rotation the restored agent would otherwise keep
+    # sending with the old key, silently. Compared by digest (sha256sum is already required;
+    # cmp may be missing); nothing from the file is printed.
+    ENV_CHANGED=0
+    [ "$(sha256sum < "$PREV_ENV" 2>/dev/null)" = "$(sha256sum < "$AGENT_ENV" 2>/dev/null)" ] || ENV_CHANGED=1
     printf '%b%s%b\n' "${YELLOW}↩️  Update to " "$SIGNED_VERSION" " failed — restoring the previous agent...${NC}"
     rb_step "restore the binary" mv -f "$PREV_BIN" "$INSTALL_DIR/$BINARY_NAME"
     rb_step "restore the configuration" mv -f "$PREV_CONFIG" "$CONFIG_DIR/$CONFIG_FILE"
@@ -806,15 +822,22 @@ rollback() {
     if [ "$RB_FAILED" -eq 0 ] && stays_up; then
         printf '%b%s%b\n' "${RED}❌ Update to " "$SIGNED_VERSION" " failed; the previous agent is restored and running.${NC}"
         printf '%b' "   The failed release's logs are above.\n"
+        note_env_not_applied
         exit 1
     fi
     printf '%b%s%b\n' "${RED}❌ Update to " "$SIGNED_VERSION" " failed, and the restored previous agent did not stay up either.${NC}"
+    note_env_not_applied
     show_recent_logs
     show_follow_hint
     exit 1
 }
+note_env_not_applied() {
+    [ "$ENV_CHANGED" -eq 1 ] || return 0
+    printf '%b' "${YELLOW}   The API key or endpoint given to this run was not applied: the restored agent keeps${NC}\n"
+    printf '%b' "${YELLOW}   its previous ones. Re-run this command once a fixed release is out.${NC}\n"
+}
 
-if stays_up; then
+if [ "$START_FAILED" -eq 0 ] && stays_up; then
     # The update held; the snapshot has done its job. A failed rm only leaves a stale
     # snapshot, which the next run clears before anything else.
     rm -f "$PREV_BIN" "$PREV_CONFIG" "$PREV_ENV" "$PREV_UNIT" 2>/dev/null || true
@@ -823,6 +846,11 @@ elif [ "$SNAPSHOT" -eq 1 ]; then
     printf '%b' "${RED}❌ The updated agent failed to start.${NC}\n"
     show_recent_logs
     rollback
+elif [ "$START_FAILED" -eq 1 ]; then
+    printf '%b' "${RED}❌ systemd could not start the agent (see the systemctl error above).${NC}\n"
+    show_recent_logs
+    show_follow_hint
+    exit 1
 else
     printf '%b' "${RED}❌ The agent failed to start and is restarting in a loop.${NC}\n"
     show_recent_logs
