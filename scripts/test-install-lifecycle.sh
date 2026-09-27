@@ -206,7 +206,8 @@ run "sh /root/mirror-build.sh broken v1.3.1 ok ok latest broken"
 render "$ORIGIN/broken" /root/install-broken.sh
 
 # A healthy agent + a failed update: the full snapshot is restored (same binary inode,
-# and the same config and agent.env even though this run also changed the endpoint) and
+# and the same config, unit and agent.env even though the broken release changes the
+# config and unit and this run also changes the endpoint) and
 # the run still exits 1.
 settle
 BEFORE="$(state)"

@@ -11,8 +11,10 @@
 #              realistic attacker); empty = a zero-byte .sig; none = no .sig
 #   <dir>:     binaries/otel/<dir>/ (default latest). Other dirs of <name> are kept.
 #   config:    ok = genuine; broken = an unknown top-level key appended, so the release is
-#              validly signed but the collector refuses to start on it (update rollback).
-#              Its SHA256SUMS line is always recomputed from the served file.
+#              validly signed but the collector refuses to start on it (update rollback),
+#              plus a comment line appended to the unit so the unit differs too and its
+#              restore is observable. Both SHA256SUMS lines are always recomputed from the
+#              served files.
 set -eu
 name=$1 ver=$2 bin=$3 sig=$4 dir=${5:-latest} cfg=${6:-ok}
 arch=$(dpkg --print-architecture)
@@ -23,10 +25,14 @@ mkdir -p "$d" "$m/configs/linux"
 cp /root/mirrors/src/configs/linux/* "$m/configs/linux/"
 case "$cfg" in
     ok) ;;
-    broken) printf 'monitorable_rollback_test: 1\n' >> "$m/configs/linux/collector-config.yaml" ;;
+    broken)
+        printf 'monitorable_rollback_test: 1\n' >> "$m/configs/linux/collector-config.yaml"
+        printf '# monitorable-rollback-test\n' >> "$m/configs/linux/monitorable-agent.service"
+        ;;
     *) echo "mirror-build: unknown config mode '$cfg'" >&2; exit 1 ;;
 esac
 cfg_sha=$(sha256sum "$m/configs/linux/collector-config.yaml" | cut -d' ' -f1)
+unit_sha=$(sha256sum "$m/configs/linux/monitorable-agent.service" | cut -d' ' -f1)
 cp "/root/mirrors/src/monitorable-agent-linux-$arch" "$d/"
 if [ "$bin" = tampered ]; then printf x >> "$d/monitorable-agent-linux-$arch"; fi
 {
@@ -37,7 +43,10 @@ if [ "$bin" = tampered ]; then printf x >> "$d/monitorable-agent-linux-$arch"; f
     esac
     # Staging's own sums already carry a version line once it publishes signed releases.
     grep -v '^# version ' /root/mirrors/src/SHA256SUMS |
-        awk -v s="$cfg_sha" '$2 == "collector-config.yaml" { print s "  " $2; next } { print }'
+        awk -v c="$cfg_sha" -v u="$unit_sha" '
+            $2 == "collector-config.yaml" { print c "  " $2; next }
+            $2 == "monitorable-agent.service" { print u "  " $2; next }
+            { print }'
 } > "$d/SHA256SUMS"
 case "$sig" in
     ok) openssl dgst -sha256 -sign /root/tls/sign.key -out "$d/SHA256SUMS.sig" "$d/SHA256SUMS" ;;
