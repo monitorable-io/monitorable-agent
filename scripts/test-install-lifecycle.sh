@@ -25,6 +25,13 @@ out_has() { run "grep -qF -- '$1' /tmp/out"; }
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; run 'tail -n 20 /tmp/out' || true; FAILS=$((FAILS + 1)); }
 check() { if eval "$2"; then pass "$1"; else fail "$1"; fi; }
+# Update rollback evidence (spec 2026-09-27 §6). The binary is compared by inode: the good and
+# broken mirrors ship the same bytes, and the hard-link restore brings back the exact
+# pre-update inode. The config, agent.env and unit are compared by sha256.
+state() { run "stat -c %i /opt/monitorable/monitorable-agent && sha256sum /etc/monitorable/collector-config.yaml /etc/monitorable/agent.env /etc/systemd/system/monitorable-agent.service | cut -d' ' -f1" | tr '\n' ' '; }
+no_prev() { ! run "test -e /opt/monitorable/monitorable-agent.prev || test -e /etc/monitorable/collector-config.yaml.prev || test -e /etc/monitorable/agent.env.prev || test -e /etc/monitorable/monitorable-agent.service.prev"; }
+# install.sh snapshots only an agent whose main process has been up >= 10s; wait past that.
+settle() { sleep 12; }
 
 # Genuine files, TLS certificate and throwaway signing key.
 raw "rm -rf /root/mirrors /root/tls && mkdir -p /root/tls /root/mirrors/src/configs/linux"
@@ -186,9 +193,134 @@ check fresh-install '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorab
 SHA="$(run "sha256sum /opt/monitorable/monitorable-agent" | cut -d' ' -f1)"
 check fresh-install-prints-sha256 '[ -n "$SHA" ] && out_has "sha256 $SHA"'
 
-# key-free update keeps key + endpoint
+# key-free update keeps key + endpoint; a healthy agent is snapshotted, and the snapshot is
+# gone once the update stays up
+settle
 rc=$(run_rc "sh /root/install.sh")
-check keyfree-update '[ "$rc" = 0 ] && out_has "Updating the existing agent" && run "grep -qx MONITORABLE_API_KEY=$KEY /etc/monitorable/agent.env && grep -qx MONITORABLE_ENDPOINT=$ENDPOINT /etc/monitorable/agent.env"'
+check keyfree-update '[ "$rc" = 0 ] && out_has "Updating the existing agent" && out_has "Saved the running agent for rollback" && no_prev && run "grep -qx MONITORABLE_API_KEY=$KEY /etc/monitorable/agent.env && grep -qx MONITORABLE_ENDPOINT=$ENDPOINT /etc/monitorable/agent.env"'
+
+# --- Update rollback (spec docs/superpowers/specs/2026-09-27-update-rollback-design.md) ---
+# A validly signed v1.3.1 whose config the collector refuses: every signature, version and
+# checksum check passes, then the agent exits on start.
+run "sh /root/mirror-build.sh broken v1.3.1 ok ok latest broken"
+render "$ORIGIN/broken" /root/install-broken.sh
+
+# A healthy agent + a failed update: the full snapshot is restored (same binary inode,
+# and the same config, unit and agent.env even though the broken release changes the
+# config and unit and this run also changes the endpoint) and
+# the run still exits 1.
+settle
+BEFORE="$(state)"
+rc=$(run_rc "sh /root/install-broken.sh --endpoint=https://ingest-mon.ok9k.com/")
+# The endpoint this run asked for is dropped with the rest of the new release, and the
+# output says so.
+check update-rolls-back '[ "$rc" = 1 ] && out_has "Saved the running agent for rollback" && out_has "restoring the previous agent" && out_has "previous agent is restored and running" && out_has "was not applied" && run "systemctl is-active --quiet monitorable-agent" && [ "$(state)" = "$BEFORE" ] && no_prev'
+
+# The unconditional clear fails (a directory where a snapshot file goes): exit 1 before any
+# rename, the old agent untouched.
+settle
+BEFORE="$(state)"
+run "mkdir /etc/monitorable/agent.env.prev"
+rc=$(run_rc "sh /root/install-broken.sh")
+check snapshot-failure-untouched '[ "$rc" = 1 ] && out_has "Could not clear the old rollback snapshot" && out_has "the existing agent is untouched" && run "systemctl is-active --quiet monitorable-agent" && [ "$(state)" = "$BEFORE" ]'
+run "rmdir /etc/monitorable/agent.env.prev"
+
+# The snapshot copy fails partway (a full /etc/monitorable): the binary's hard link is
+# already made when the config copy hits ENOSPC. Exit 1 before any rename, the partial
+# snapshot removed, the old agent untouched. A tmpfs stands in for a full disk: room for
+# the current files plus exactly one download of the broken release's config (install.sh
+# stages that one download, collector-config.yaml.tmp, in /etc/monitorable), so the
+# download fits and the snapshot's config copy is the first write that doesn't. This
+# unprivileged container may mount tmpfs (the uninstall-rm-failure case below does too).
+settle
+BEFORE="$(state)"
+run "rm -rf /root/etcmon && cp -a /etc/monitorable /root/etcmon && b=0 && for f in /root/etcmon/*; do b=\$((b + (\$(stat -c %s \"\$f\") + 4095) / 4096)); done && c=\$(( (\$(stat -c %s /root/mirrors/broken/configs/linux/collector-config.yaml) + 4095) / 4096 )) && mount -t tmpfs -o nr_blocks=\$((b + c)),mode=\$(stat -c %a /root/etcmon),uid=0,gid=0 tmpfs /etc/monitorable && cp -a /root/etcmon/. /etc/monitorable/"
+# Exactly one broken-config download fits, and nothing after it.
+check tmpfs-full-precondition 'run "cmp -s /root/etcmon/agent.env /etc/monitorable/agent.env && cp /root/mirrors/broken/configs/linux/collector-config.yaml /etc/monitorable/probe1 && ! cp /root/etcmon/agent.env /etc/monitorable/probe2 2>/dev/null"'
+run "rm -f /etc/monitorable/probe1 /etc/monitorable/probe2"
+rc=$(run_rc "sh /root/install-broken.sh")
+check snapshot-save-failure-untouched '[ "$rc" = 1 ] && out_has "Could not save the running agent for rollback" && out_has "the existing agent is untouched" && run "systemctl is-active --quiet monitorable-agent" && no_prev'
+# Compared while the tmpfs is still mounted: it holds the only config and agent.env this
+# run could have touched (after the umount the untouched originals underneath show).
+check snapshot-save-failure-state-mounted '[ "$(state)" = "$BEFORE" ]'
+run "umount /etc/monitorable"
+check snapshot-save-failure-state '[ "$(state)" = "$BEFORE" ]'
+
+# The restored agent fails too: a test-only drop-in (not snapshotted, so it survives the
+# rollback) fails ExecStartPre once /run/mon-fail exists. "+" runs it outside the unit's
+# sandbox (NoExecPaths=/ would otherwise block /bin/sh).
+run "mkdir -p /etc/systemd/system/monitorable-agent.service.d && printf '[Service]\nExecStartPre=+/bin/sh -c \"! test -e /run/mon-fail\"\n' > /etc/systemd/system/monitorable-agent.service.d/rollback-test.conf && systemctl daemon-reload && systemctl restart monitorable-agent"
+settle
+check rollback-also-fails-precondition 'run "systemctl is-active --quiet monitorable-agent"'
+BEFORE="$(state)"
+run "touch /run/mon-fail"
+rc=$(run_rc "sh /root/install-broken.sh")
+# The restored files stay in place (spec §4.1); a key-free run changed no agent.env, so
+# there's no "not applied" note.
+check rollback-also-fails '[ "$rc" = 1 ] && out_has "Saved the running agent for rollback" && out_has "did not stay up either" && ! out_has "previous agent is restored and running" && ! out_has "was not applied" && [ "$(state)" = "$BEFORE" ] && no_prev'
+run "rm -rf /etc/systemd/system/monitorable-agent.service.d /run/mon-fail && systemctl daemon-reload"
+rc=$(run_rc "sh /root/install.sh")
+check reinstall-after-rollback-failure '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
+
+# An agent up for less than 10s is not "healthy": no snapshot, today's failure.
+run "systemctl restart monitorable-agent"
+rc=$(run_rc "sh /root/install-broken.sh")
+check young-agent-no-rollback '[ "$rc" = 1 ] && out_has "failed to start and is restarting in a loop" && ! out_has "Saved the running agent" && ! out_has "restoring" && no_prev'
+rc=$(run_rc "sh /root/install.sh")
+check reinstall-after-young '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
+
+# A stopped agent (MainPID=0) is not "healthy" either: the broken config stays live.
+settle
+run "systemctl stop monitorable-agent"
+rc=$(run_rc "sh /root/install-broken.sh")
+check unhealthy-no-rollback '[ "$rc" = 1 ] && out_has "failed to start and is restarting in a loop" && ! out_has "Saved the running agent" && ! out_has "restoring" && run "grep -q monitorable_rollback_test /etc/monitorable/collector-config.yaml" && no_prev'
+
+# Leftover snapshots from an interrupted run are cleared even when no new snapshot is
+# taken (the agent is stopped), so a later run can never restore them.
+run "systemctl stop monitorable-agent && for p in /opt/monitorable/monitorable-agent.prev /etc/monitorable/collector-config.yaml.prev /etc/monitorable/agent.env.prev /etc/monitorable/monitorable-agent.service.prev; do echo junk > \$p; done"
+rc=$(run_rc "sh /root/install.sh")
+check stale-prev-cleared '[ "$rc" = 0 ] && ! out_has "Saved the running agent" && no_prev && run "systemctl is-active --quiet monitorable-agent"'
+
+# A run killed after the binary rename but before the restart leaves the OLD process
+# running while the NEW binary sits on disk. That process isn't "healthy" for a snapshot:
+# the snapshot would hold the new files, not what is running. Simulated by swapping the
+# on-disk binary for a copy (a new inode) under the running agent.
+settle
+run "cp /opt/monitorable/monitorable-agent /opt/monitorable/agent.copy && mv -f /opt/monitorable/agent.copy /opt/monitorable/monitorable-agent"
+rc=$(run_rc "sh /root/install-broken.sh")
+check stale-running-binary-no-snapshot '[ "$rc" = 1 ] && ! out_has "Saved the running agent" && ! out_has "restoring" && no_prev'
+rc=$(run_rc "sh /root/install.sh")
+check reinstall-after-stale-binary '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
+
+# `systemctl enable` fails after the renames (multi-user.target.wants is a file, not a
+# directory): an update failure like a failed restart, so a snapshot is rolled back
+# instead of the script dying under set -e with the new files on disk. The restored agent
+# restarts fine (restart doesn't need enable). A key-free run: nothing to report as not
+# applied.
+settle
+BEFORE="$(state)"
+run "mv /etc/systemd/system/multi-user.target.wants /root/wants.bak && touch /etc/systemd/system/multi-user.target.wants"
+check enable-failure-precondition '! run "systemctl enable monitorable-agent >/dev/null 2>&1"'
+rc=$(run_rc "sh /root/install.sh")
+check enable-failure-rolls-back '[ "$rc" = 1 ] && out_has "Saved the running agent for rollback" && out_has "previous agent is restored and running" && ! out_has "was not applied" && run "systemctl is-active --quiet monitorable-agent" && [ "$(state)" = "$BEFORE" ] && no_prev'
+run "rm -f /etc/systemd/system/multi-user.target.wants && mv /root/wants.bak /etc/systemd/system/multi-user.target.wants && systemctl daemon-reload"
+
+# A restart that fails outright with no snapshot (the agent was stopped) says so, instead
+# of "restarting in a loop".
+run "mkdir -p /etc/systemd/system/monitorable-agent.service.d && printf '[Service]\nExecStartPre=+/bin/sh -c \"! test -e /run/mon-fail\"\n' > /etc/systemd/system/monitorable-agent.service.d/rollback-test.conf && touch /run/mon-fail && systemctl daemon-reload && systemctl stop monitorable-agent"
+rc=$(run_rc "sh /root/install.sh")
+check restart-failure-message '[ "$rc" = 1 ] && out_has "systemd could not start the agent" && ! out_has "restarting in a loop" && ! out_has "Saved the running agent"'
+run "rm -rf /etc/systemd/system/monitorable-agent.service.d /run/mon-fail && systemctl daemon-reload"
+rc=$(run_rc "sh /root/install.sh")
+check reinstall-after-restart-failure '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
+
+# A healthy current agent next to a leftover pre-v1.2.0 unit file takes no snapshot (spec
+# §3.1): the legacy migration deletes files after the renames. This is the case where only
+# the legacy-unit guard, not a missing agent, keeps the snapshot off.
+settle
+run "printf '[Service]\nExecStart=/bin/sleep infinity\n' > /etc/systemd/system/monitorable-collector.service && systemctl daemon-reload"
+rc=$(run_rc "sh /root/install.sh")
+check keyfree-legacy-healthy-no-snapshot '[ "$rc" = 0 ] && ! out_has "Saved the running agent" && no_prev && ! run "test -e /etc/systemd/system/monitorable-collector.service" && run "systemctl is-active --quiet monitorable-agent"'
 
 # an explicit flag still wins over agent.env
 rc=$(run_rc "sh /root/install.sh --endpoint=https://ingest-mon.ok9k.com/")
@@ -241,7 +373,7 @@ check keyfree-on-clean-host '[ "$rc" = 1 ] && out_has "No agent is installed on 
 # reads the two lines, then installs and retires the old unit.
 run "printf '[Service]\nExecStart=/bin/sleep infinity\nEnvironment=MONITORABLE_API_KEY=%s\nEnvironment=MONITORABLE_ENDPOINT=%s\n[Install]\nWantedBy=multi-user.target\n' $KEY $ENDPOINT > /etc/systemd/system/monitorable-collector.service && systemctl daemon-reload && systemctl enable --now monitorable-collector >/dev/null 2>&1"
 rc=$(run_rc "sh /root/install.sh")
-check keyfree-legacy-unit '[ "$rc" = 0 ] && out_has "Updating the existing agent" && out_has "pre-v1.2.0" && run "grep -qx MONITORABLE_API_KEY=$KEY /etc/monitorable/agent.env && grep -qx MONITORABLE_ENDPOINT=$ENDPOINT /etc/monitorable/agent.env && systemctl is-active --quiet monitorable-agent && ! test -e /etc/systemd/system/monitorable-collector.service && ! systemctl is-active --quiet monitorable-collector"'
+check keyfree-legacy-unit '[ "$rc" = 0 ] && out_has "Updating the existing agent" && out_has "pre-v1.2.0" && run "grep -qx MONITORABLE_API_KEY=$KEY /etc/monitorable/agent.env && grep -qx MONITORABLE_ENDPOINT=$ENDPOINT /etc/monitorable/agent.env && systemctl is-active --quiet monitorable-agent && ! test -e /etc/systemd/system/monitorable-collector.service && ! systemctl is-active --quiet monitorable-collector" && ! out_has "Saved the running agent" && no_prev'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # a pre-v1.2.0 unit without the key line is still "No agent is installed", never an

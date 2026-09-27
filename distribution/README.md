@@ -173,6 +173,41 @@ sums match only one of them. A fresh install started inside that window therefor
 without touching the host — fail-closed by design — and simply needs to be retried once the
 release job reports success. Existing agents are unaffected; they never re-download.
 
+### Failed-update rollback (v1.3.3+)
+
+An update (re-running the installer on a host with an agent) that fails the stay-up check
+puts the previous agent back. Before any side effect the installer records whether the
+running agent is healthy: the current `monitorable-agent` unit, binary, config and
+`agent.env` present, `active`/`running`, main process up ≥ 10 s (measured with
+`/proc/<pid>/stat` start times, because lxcfs virtualises `/proc/uptime` in LXC) and running
+the binary that is on disk (not an older one left running by an interrupted run). Right before
+the install renames it clears any old snapshot, then, for a healthy agent only, snapshots:
+
+| Live file | Snapshot |
+|---|---|
+| `/opt/monitorable/monitorable-agent` | `/opt/monitorable/monitorable-agent.prev` (hard link) |
+| `/etc/monitorable/collector-config.yaml` | `/etc/monitorable/collector-config.yaml.prev` |
+| `/etc/monitorable/agent.env` | `/etc/monitorable/agent.env.prev` |
+| `/etc/systemd/system/monitorable-agent.service` | `/etc/monitorable/monitorable-agent.service.prev` |
+
+- **Update stays up:** the snapshot is deleted.
+- **Update fails** (it doesn't stay up, or `daemon-reload`, `enable` or the restart fails
+  outright): the snapshot is renamed back and the service is restarted and re-checked.
+  - The run exits 1 either way.
+  - The output says whether the previous agent is running again.
+  - If this run gave a new API key or endpoint, the output says it was not applied: the
+    restored agent keeps its previous `agent.env`.
+- **No snapshot** (fresh install, an agent already down or up for less than 10 s, the pre-v1.2.0
+  migration): a failure is reported as before, as "restarting in a loop", or, when systemd
+  refused the start outright, "systemd could not start the agent".
+
+Snapshots never go under `/var/lib/monitorable`, which the agent user can write. The rollback
+never downloads anything, so it doesn't check `MIN_VERSION`. The on-disk queue is not snapshotted.
+
+An interrupted update (for example, a dropped SSH session) can leave a host on the new
+release with the snapshot still in place. Re-run the update: the next run clears the old
+snapshot first. Spec: platform `docs/superpowers/specs/2026-09-27-update-rollback-design.md`.
+
 ### Rollback semantics
 
 The config and unit objects on R2 are unversioned while binaries are versioned, and
