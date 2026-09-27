@@ -362,6 +362,44 @@ if [ ! -d /run/systemd/system ] || ! command -v systemctl >/dev/null 2>&1; then
     exit 1
 fi
 
+# Update rollback (spec 2026-09-27-update-rollback-design.md): an update snapshots the
+# running agent and restores it if the new release fails the stay-up check at the end —
+# but only an agent that was healthy before this run, so a rollback never restores a crash
+# loop. Recorded here, before any side effect. Healthy = the current unit (not the
+# pre-v1.2.0 one) with all three files present, active/running, and a main process up
+# >= 10s (a crash loop with RestartSec=10 never gets that old). Snapshots live only in
+# root-owned directories: /var/lib/monitorable is writable by the agent user, and root must
+# never "restore" a binary the agent could have planted.
+PREV_BIN="$INSTALL_DIR/$BINARY_NAME.prev"
+PREV_CONFIG="$CONFIG_DIR/$CONFIG_FILE.prev"
+PREV_ENV="$AGENT_ENV.prev"
+PREV_UNIT="$CONFIG_DIR/$UNIT_FILE.prev"
+PREV_HEALTHY=0
+SNAPSHOT=0
+# agent_age_ok: 0 when the agent's main process has been up >= 10s. Both start times come
+# from /proc/<pid>/stat (clock ticks since boot, field 22). Never /proc/uptime: lxcfs
+# virtualises it in LXC containers while systemd's timestamps stay on the host clock.
+# This shell ($$) started moments ago, so the difference is the agent's age.
+agent_age_ok() {
+    _pid="$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)" || return 1
+    case "$_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+    # Strip "pid (comm) " first: comm may contain spaces or ")".
+    _agent_start="$(sed 's/.*) //' "/proc/$_pid/stat" 2>/dev/null | cut -d' ' -f20)"
+    _self_start="$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | cut -d' ' -f20)"
+    case "$_agent_start" in ''|*[!0-9]*) return 1 ;; esac
+    case "$_self_start" in ''|*[!0-9]*) return 1 ;; esac
+    _hz="$(getconf CLK_TCK 2>/dev/null)" || _hz=100
+    case "$_hz" in ''|0|*[!0-9]*) _hz=100 ;; esac
+    [ $(( (_self_start - _agent_start) / _hz )) -ge 10 ]
+}
+if [ -f "/etc/systemd/system/$UNIT_FILE" ] && [ ! -f "$LEGACY_UNIT" ] &&
+    [ -f "$INSTALL_DIR/$BINARY_NAME" ] && [ -f "$CONFIG_DIR/$CONFIG_FILE" ] && [ -f "$AGENT_ENV" ] &&
+    [ "$(systemctl show -p ActiveState --value "$SERVICE_NAME" 2>/dev/null)" = active ] &&
+    [ "$(systemctl show -p SubState --value "$SERVICE_NAME" 2>/dev/null)" = running ] &&
+    agent_age_ok; then
+    PREV_HEALTHY=1
+fi
+
 # Create installation and configuration directories. Only these two, before the download:
 # the downloads are staged in them. The service user comes after verification, so a failed
 # fresh install leaves no account (and no docker-group membership) behind.
@@ -614,6 +652,32 @@ else
     printf '%b' "${BLUE}💽 No physical disk detected — SMART disabled (no extra privileges)${NC}\n"
 fi
 
+# --- Update rollback snapshot ------------------------------------------------------------
+# Clear first, unconditionally: a snapshot left by an interrupted run must never be restored
+# by a later one. Then snapshot a healthy agent. The binary is a hard link, which costs
+# nothing: the rename below replaces the directory entry and the old inode lives on through
+# .prev. cp -p keeps owner and mode (agent.env.prev stays root 0600). Any failure here stops
+# the run before a single live file is replaced.
+if ! rm -f "$PREV_BIN" "$PREV_CONFIG" "$PREV_ENV" "$PREV_UNIT"; then
+    printf '%b' "${RED}❌ Could not clear the old rollback snapshot${NC}\n"
+    printf '%b' "${RED}   Nothing was installed; the existing agent is untouched.${NC}\n"
+    exit 1
+fi
+if [ "$PREV_HEALTHY" -eq 1 ]; then
+    if ln -f "$INSTALL_DIR/$BINARY_NAME" "$PREV_BIN" &&
+        cp -p "$CONFIG_DIR/$CONFIG_FILE" "$PREV_CONFIG" &&
+        cp -p "$AGENT_ENV" "$PREV_ENV" &&
+        cp -p "/etc/systemd/system/$UNIT_FILE" "$PREV_UNIT"; then
+        SNAPSHOT=1
+        printf '%b' "${BLUE}📸 Saved the running agent for rollback${NC}\n"
+    else
+        rm -f "$PREV_BIN" "$PREV_CONFIG" "$PREV_ENV" "$PREV_UNIT" 2>/dev/null || true
+        printf '%b' "${RED}❌ Could not save the running agent for rollback${NC}\n"
+        printf '%b' "${RED}   Nothing was installed; the existing agent is untouched.${NC}\n"
+        exit 1
+    fi
+fi
+
 # --- Install the verified artifacts ------------------------------------------------------
 # Binary: chmod on the temp path then rename. On a re-run/upgrade the old binary may still
 # be executing and the kernel refuses to overwrite a running file (ETXTBSY); a rename swaps
@@ -692,23 +756,77 @@ systemctl enable "$SERVICE_NAME"
 # would never load. reset-failed first clears any prior crash-loop counters so the
 # NRestarts check below reflects only this (re)start, not stale history.
 systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
-systemctl restart "$SERVICE_NAME"
+# A restart that fails outright (a failing ExecStartPre, a rejected unit) is the plainest
+# case of not staying up: it must reach the check below and its rollback, not end the
+# script here under set -e with the new release half-started and no logs.
+systemctl restart "$SERVICE_NAME" || true
 
 # Verify the collector actually STAYS up. With Type=simple, systemd reports
 # "active" the instant ExecStart forks — before the process can fail (bad config,
 # missing capability) — so an immediate is-active check is unreliable. Wait for
 # the unit to settle, then treat a non-active state OR any
 # auto-restart (NRestarts > 0, i.e. it already crashed once) as a failed install.
-sleep 4
-NRESTARTS="$(systemctl show -p NRestarts --value "$SERVICE_NAME" 2>/dev/null || echo 0)"
-if systemctl is-active --quiet "$SERVICE_NAME" && [ "${NRESTARTS:-0}" -eq 0 ]; then
-    printf '%b' "${GREEN}✅ Service started successfully!${NC}\n"
-else
-    printf '%b' "${RED}❌ The agent failed to start and is restarting in a loop.${NC}\n"
+stays_up() {
+    sleep 4
+    NRESTARTS="$(systemctl show -p NRestarts --value "$SERVICE_NAME" 2>/dev/null || echo 0)"
+    systemctl is-active --quiet "$SERVICE_NAME" && [ "${NRESTARTS:-0}" -eq 0 ]
+}
+show_recent_logs() {
     printf '%b' "${YELLOW}Recent logs:${NC}\n"
     journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null || true
+}
+show_follow_hint() {
     printf '%b' "\n${YELLOW}Follow the logs with:${NC}\n"
     printf '%b' "   journalctl -u $SERVICE_NAME -f\n"
+}
+# rb_step <what> <command...>: one rollback step. A failure is reported and recorded, never
+# fatal: under set -e one failed mv would stop the rollback halfway and leave a host with
+# half-new, half-old files, so the rollback restores what it can and then checks.
+rb_step() {
+    _what="$1"
+    shift
+    if ! "$@"; then
+        printf '%b' "${RED}   ✗ Could not ${NC}"
+        printf '%s\n' "$_what"
+        RB_FAILED=1
+    fi
+}
+# rollback: put the snapshot back (the renames consume it, so no .prev is left), restart,
+# and check again. Always exits 1: the update failed either way.
+rollback() {
+    RB_FAILED=0
+    printf '%b%s%b\n' "${YELLOW}↩️  Update to " "$SIGNED_VERSION" " failed — restoring the previous agent...${NC}"
+    rb_step "restore the binary" mv -f "$PREV_BIN" "$INSTALL_DIR/$BINARY_NAME"
+    rb_step "restore the configuration" mv -f "$PREV_CONFIG" "$CONFIG_DIR/$CONFIG_FILE"
+    rb_step "restore agent.env" mv -f "$PREV_ENV" "$AGENT_ENV"
+    rb_step "restore the unit" mv -f "$PREV_UNIT" "/etc/systemd/system/$UNIT_FILE"
+    rb_step "reload systemd" systemctl daemon-reload
+    systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
+    rb_step "restart the service" systemctl restart "$SERVICE_NAME"
+    if [ "$RB_FAILED" -eq 0 ] && stays_up; then
+        printf '%b%s%b\n' "${RED}❌ Update to " "$SIGNED_VERSION" " failed; the previous agent is restored and running.${NC}"
+        printf '%b' "   The failed release's logs are above.\n"
+        exit 1
+    fi
+    printf '%b%s%b\n' "${RED}❌ Update to " "$SIGNED_VERSION" " failed, and the restored previous agent did not stay up either.${NC}"
+    show_recent_logs
+    show_follow_hint
+    exit 1
+}
+
+if stays_up; then
+    # The update held; the snapshot has done its job. A failed rm only leaves a stale
+    # snapshot, which the next run clears before anything else.
+    rm -f "$PREV_BIN" "$PREV_CONFIG" "$PREV_ENV" "$PREV_UNIT" 2>/dev/null || true
+    printf '%b' "${GREEN}✅ Service started successfully!${NC}\n"
+elif [ "$SNAPSHOT" -eq 1 ]; then
+    printf '%b' "${RED}❌ The updated agent failed to start.${NC}\n"
+    show_recent_logs
+    rollback
+else
+    printf '%b' "${RED}❌ The agent failed to start and is restarting in a loop.${NC}\n"
+    show_recent_logs
+    show_follow_hint
     exit 1
 fi
 
