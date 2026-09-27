@@ -1,6 +1,6 @@
 #!/bin/sh
-# Test-only mirror builder for scripts/test-install-lifecycle.sh. Runs INSIDE the LXD
-# container: builds /root/mirrors/<name>/ from the genuine staging files in
+# Test-only mirror builder for scripts/test-install-lifecycle.sh. Runs ON the test
+# host (LXD container or VM): builds /root/mirrors/<name>/ from the genuine staging files in
 # /root/mirrors/src, signed with the harness's throwaway key /root/tls/sign.key.
 # Usage: mirror-build.sh <name> <version> <ok|tampered> <ok|bad|otherkey|empty|none> [<dir> [<ok|broken>]]
 #   <version>: vX.Y.Z written as "# version vX.Y.Z"; "-" writes no version line; "dup"
@@ -17,7 +17,7 @@
 #              served files.
 set -eu
 name=$1 ver=$2 bin=$3 sig=$4 dir=${5:-latest} cfg=${6:-ok}
-arch=$(dpkg --print-architecture)
+case $(uname -m) in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "mirror-build: unsupported arch $(uname -m)" >&2; exit 1 ;; esac
 m=/root/mirrors/$name
 d=$m/binaries/otel/$dir
 rm -rf "$d"
