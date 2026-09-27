@@ -4,7 +4,7 @@
 # /root/mirrors/src, signed with the harness's throwaway key /root/tls/sign.key.
 # Usage: mirror-build.sh <name> <version> <ok|tampered> <ok|bad|otherkey|empty|none> [<dir> [<ok|broken>]]
 #   <version>: vX.Y.Z written as "# version vX.Y.Z"; "-" writes no version line; "dup"
-#              writes two ("v1.3.0" and "v9.9.9")
+#              writes two ("v1.3.0" and "v9.9.9"); "crlf" writes "v1.3.0" with a CRLF ending
 #   binary:    ok = genuine; tampered = one byte appended
 #   signature: ok = valid; bad = a valid signature over OTHER bytes; otherkey = a valid
 #              signature over THESE sums by a different key (/root/tls/other.key, the
@@ -16,6 +16,10 @@
 #              restore is observable. Both SHA256SUMS lines are always recomputed from the
 #              served files.
 set -eu
+if [ $# -lt 4 ]; then
+    echo "usage: mirror-build.sh <name> <version> <ok|tampered> <ok|bad|otherkey|empty|none> [<dir> [<ok|broken>]]" >&2
+    exit 1
+fi
 name=$1 ver=$2 bin=$3 sig=$4 dir=${5:-latest} cfg=${6:-ok}
 case $(uname -m) in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "mirror-build: unsupported arch $(uname -m)" >&2; exit 1 ;; esac
 m=/root/mirrors/$name
@@ -39,6 +43,7 @@ if [ "$bin" = tampered ]; then printf x >> "$d/monitorable-agent-linux-$arch"; f
     case "$ver" in
         -) ;;
         dup) printf '# version v1.3.0\n# version v9.9.9\n' ;;
+        crlf) printf '# version v1.3.0\r\n' ;;
         *) printf '# version %s\n' "$ver" ;;
     esac
     # Staging's own sums already carry a version line once it publishes signed releases.
