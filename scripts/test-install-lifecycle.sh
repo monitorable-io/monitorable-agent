@@ -1,13 +1,17 @@
 #!/bin/sh
-# Lifecycle harness for distribution/install.sh. Dev host only (needs LXD).
-# Usage: scripts/test-install-lifecycle.sh <lxd-container>
-# The container must be a networked Ubuntu 24.04 that can reach get-mon.ok9k.com (the
-# genuine files are copied from there once). Every install then runs against a local
+# Lifecycle harness for distribution/install.sh. Dev host only.
+# Usage: scripts/test-install-lifecycle.sh <lxd-container | ssh:user@host>
+#   <lxd-container>: commands run through `lxc exec` (e.g. web-01).
+#   ssh:user@host:   commands run over SSH as that (root) user, e.g. ssh:root@172.17.0.241 for
+#                    the SELinux VM sel-01, where lxd-agent dies under enforcing. SSH_KEY=<file>
+#                    picks the key (with IdentitiesOnly).
+# The host must be a networked Ubuntu 24.04 or AlmaLinux 9 that can reach get-mon.ok9k.com
+# (the genuine files are copied from there once). Every install then runs against a local
 # https mirror (scripts/install-test-mirror.py) serving copies re-signed with a throwaway
 # key, so the harness can stage any signature, version or checksum failure.
 # shellcheck disable=SC2016,SC2034  # check() strings hold $vars for eval to expand later; rc feeds them the same way.
 set -eu
-CT="${1:?usage: $0 <lxd-container>}"
+CT="${1:?usage: $0 <lxd-container | ssh:user@host>}"
 SRC_URL="${SRC_URL:-https://get-mon.ok9k.com}"
 ORIGIN="https://localhost:8443"
 KEY="$(printf '%064d' 0 | tr 0 a)"
@@ -15,12 +19,34 @@ ENDPOINT="https://ingest-mon.ok9k.com"
 MIN="v1.3.0"
 FAILS=0
 
+# ct <env assignment | -> <cmd>: runs <cmd> with sh -c on the test host, stdin passed through.
+# Over SSH the remote shell parses the command line once more, so <cmd> is single-quoted
+# ('\'' for each quote) and reaches sh -c byte for byte, as it does through lxc exec.
+case "$CT" in
+    ssh:*)
+        SSH_DEST="${CT#ssh:}"
+        SSH_CTL="$(mktemp -d)"
+        # One multiplexed connection for the run's several hundred commands.
+        set -- -o ControlMaster=auto -o ControlPath="$SSH_CTL/c" -o ControlPersist=60 -o BatchMode=yes
+        if [ -n "${SSH_KEY:-}" ]; then set -- "$@" -i "$SSH_KEY" -o IdentitiesOnly=yes; fi
+        SSH_OPTS="$*"
+        q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+        # shellcheck disable=SC2086,SC2029  # SSH_OPTS: whitespace-free options, split on purpose; the command is quoted here, locally.
+        ct() { if [ "$1" = - ]; then ssh $SSH_OPTS "$SSH_DEST" "sh -c $(q "$2")"; else ssh $SSH_OPTS "$SSH_DEST" "env $1 sh -c $(q "$2")"; fi; }
+        ;;
+    *)
+        SSH_CTL=
+        ct() { if [ "$1" = - ]; then lxc exec "$CT" -- sh -c "$2"; else lxc exec "$CT" --env "$1" -- sh -c "$2"; fi; }
+        ;;
+esac
 # Every harness command trusts the mirror's self-signed certificate (and only it).
-run() { lxc exec "$CT" --env CURL_CA_BUNDLE=/root/tls/cert.pem -- sh -c "$1"; }
-# run_rc <cmd>: prints combined output to /tmp/out in the container, returns the exit code
-run_rc() { lxc exec "$CT" --env CURL_CA_BUNDLE=/root/tls/cert.pem -- sh -c "$1 > /tmp/out 2>&1; echo \$?" ; }
+run() { ct CURL_CA_BUNDLE=/root/tls/cert.pem "$1"; }
+# run_rc <cmd>: prints combined output to /tmp/out on the test host, returns the exit code
+run_rc() { ct CURL_CA_BUNDLE=/root/tls/cert.pem "$1 > /tmp/out 2>&1; echo \$?" ; }
 # raw: no CA override, for the one-time copy from the real staging origin
-raw() { lxc exec "$CT" -- sh -c "$1"; }
+raw() { ct - "$1"; }
+# The release file name's arch, mapped from uname -m the way install.sh does (no dpkg on RHEL).
+ARCH_SH='case $(uname -m) in x86_64) a=amd64 ;; aarch64) a=arm64 ;; *) exit 1 ;; esac'
 out_has() { run "grep -qF -- '$1' /tmp/out"; }
 pass() { printf 'PASS %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; run 'tail -n 20 /tmp/out' || true; FAILS=$((FAILS + 1)); }
@@ -33,25 +59,29 @@ no_prev() { ! run "test -e /opt/monitorable/monitorable-agent.prev || test -e /e
 # install.sh snapshots only an agent whose main process has been up >= 10s; wait past that.
 settle() { sleep 12; }
 
+# SELinux denials are collected from here on (the no-selinux-denials case at the end).
+# ausearch -ts takes the date in the locale's %x format, so both sides run under LC_ALL=C.
+AVC_SINCE="$(raw "LC_ALL=C date '+%x %T'")"
+
 # Genuine files, TLS certificate and throwaway signing key.
 raw "rm -rf /root/mirrors /root/tls && mkdir -p /root/tls /root/mirrors/src/configs/linux"
-raw "a=\$(dpkg --print-architecture) && cd /root/mirrors/src && curl -fsS -o monitorable-agent-linux-\$a $SRC_URL/binaries/otel/latest/monitorable-agent-linux-\$a && curl -fsS -o SHA256SUMS $SRC_URL/binaries/otel/latest/SHA256SUMS && curl -fsS -o configs/linux/collector-config.yaml $SRC_URL/configs/linux/collector-config.yaml && curl -fsS -o configs/linux/monitorable-agent.service $SRC_URL/configs/linux/monitorable-agent.service"
+raw "$ARCH_SH && cd /root/mirrors/src && curl -fsS -o monitorable-agent-linux-\$a $SRC_URL/binaries/otel/latest/monitorable-agent-linux-\$a && curl -fsS -o SHA256SUMS $SRC_URL/binaries/otel/latest/SHA256SUMS && curl -fsS -o configs/linux/collector-config.yaml $SRC_URL/configs/linux/collector-config.yaml && curl -fsS -o configs/linux/monitorable-agent.service $SRC_URL/configs/linux/monitorable-agent.service"
 raw "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout /root/tls/key.pem -out /root/tls/cert.pem >/dev/null 2>&1"
 raw "openssl ecparam -name prime256v1 -genkey -noout -out /root/tls/sign.key"
 # A second key the installer does not embed: signs the genuine sums for the "valid
 # signature, wrong key" case.
 raw "openssl ecparam -name prime256v1 -genkey -noout -out /root/tls/other.key"
 TEST_PUB="$(raw "openssl pkey -in /root/tls/sign.key -pubout" | grep -v -- '-----' | tr -d '\n')"
-lxc file push --quiet scripts/install-test-mirror.py "$CT/root/install-test-mirror.py"
-lxc file push --quiet scripts/install-test-mirror-build.sh "$CT/root/mirror-build.sh"
-trap 'lxc exec "$CT" -- systemctl stop install-test-mirror >/dev/null 2>&1 || true' EXIT
+raw "cat > /root/install-test-mirror.py" < scripts/install-test-mirror.py
+raw "cat > /root/mirror-build.sh" < scripts/install-test-mirror-build.sh
+trap 'raw "systemctl stop install-test-mirror >/dev/null 2>&1" || true; if [ -n "$SSH_CTL" ]; then ssh -o ControlPath="$SSH_CTL/c" -O exit "$SSH_DEST" 2>/dev/null; rm -rf "$SSH_CTL"; fi' EXIT
 run "systemctl stop install-test-mirror >/dev/null 2>&1; systemd-run --quiet --collect --unit=install-test-mirror python3 /root/install-test-mirror.py"
 
 # render <base url> <path in container> [<min version>]: fill the placeholders the way the
 # backend (BASE_URL, SIGNING_PUBKEY) and the vendoring step (MIN_VERSION) do.
 render() {
     sed -e "s|@@BASE_URL@@|$1|g" -e "s|@@SIGNING_PUBKEY@@|$TEST_PUB|g" -e "s|@@MIN_VERSION@@|${3:-$MIN}|g" \
-        distribution/install.sh | lxc exec "$CT" -- sh -c "cat > $2"
+        distribution/install.sh | raw "cat > $2"
 }
 
 run "sh /root/mirror-build.sh good $MIN ok ok"
@@ -112,7 +142,7 @@ check keyfree-update-bad-signature-untouched '[ "$rc" = 1 ] && out_has "Updating
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # A template served without its placeholders filled is refused before anything else.
-lxc exec "$CT" -- sh -c "cat > /root/install-unrendered.sh" < distribution/install.sh
+raw "cat > /root/install-unrendered.sh" < distribution/install.sh
 rc=$(run_rc "sh /root/install-unrendered.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check unrendered-template-refused '[ "$rc" = 1 ] && out_has "served unrendered" && ! run "test -e /opt/monitorable"'
 
@@ -180,7 +210,8 @@ run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 # curl -o would write into that inode (still owned by its planter, who could rewrite it
 # after verification) and the rename would install it. The installed binary must be a new,
 # root-owned file.
-run "a=\$(dpkg --print-architecture) && mkdir -p /opt/monitorable && chown nobody:nogroup /opt/monitorable && printf planted > /opt/monitorable/monitorable-agent-linux-\$a.tmp && chown nobody:nogroup /opt/monitorable/monitorable-agent-linux-\$a.tmp"
+# (nobody: = nobody's login group: nogroup on Ubuntu, nobody on AlmaLinux.)
+run "$ARCH_SH && mkdir -p /opt/monitorable && chown nobody: /opt/monitorable && printf planted > /opt/monitorable/monitorable-agent-linux-\$a.tmp && chown nobody: /opt/monitorable/monitorable-agent-linux-\$a.tmp"
 rc=$(run_rc "sh /root/install.sh --endpoint=$ENDPOINT --api-key=$KEY")
 check stale-tmp-not-reused '[ "$rc" = 0 ] && [ "$(run "stat -c %U /opt/monitorable/monitorable-agent")" = root ]'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
@@ -399,6 +430,14 @@ check uninstall-rm-failure '[ "$rc" = 1 ] && out_has "Uninstall incomplete" && o
 run "mount -o remount,rw /etc/monitorable && rm -f /etc/monitorable/keepme && umount /etc/monitorable"
 rc=$(run_rc "sh /root/install.sh --uninstall")
 check uninstall-rm-failure-cleanup '[ "$rc" = 0 ] && ! run "test -e /etc/monitorable"'
+
+# Under SELinux the whole run left no AVC or USER_AVC denial. "<no matches>" is required
+# explicitly: ausearch also exits 1 on a bad -ts or a missing log, which must not pass.
+# --input-logs: without a tty (ssh, lxc exec) ausearch reads records from stdin instead of
+# the log files and finds nothing, so the check would pass vacuously. A just-booted LXD VM
+# logs lxd-agent vsock_socket denials for about a minute, so start the run after that.
+# No SELinux (this Ubuntu container) = vacuous.
+check no-selinux-denials 'run "! command -v selinuxenabled >/dev/null 2>&1 || ! selinuxenabled || LC_ALL=C ausearch --input-logs -m avc,user_avc -ts $AVC_SINCE 2>&1 | grep -qx \"<no matches>\""'
 
 printf '%s failure(s)\n' "$FAILS"
 [ "$FAILS" -eq 0 ]
