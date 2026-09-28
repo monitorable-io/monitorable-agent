@@ -108,6 +108,29 @@ if [ "$UNINSTALL" -eq 1 ] && [ "$OTHER_OPTS" -eq 1 ]; then
     exit 1
 fi
 
+# version_ge A B: true when release A >= release B. Both must be vMAJOR.MINOR.PATCH with
+# numeric parts of at most 9 digits; anything else is false, so a malformed version fails
+# closed. Compared per component as integers: v1.10.0 is newer than v1.9.0. The digit cap
+# keeps every component inside the shell's integer range: a longer one makes `[` error out,
+# and inside `if` that error reads as "not equal" and falls through to the next component.
+version_ge() {
+    for _v in "$1" "$2"; do
+        case "$_v" in v?*) ;; *) return 1 ;; esac
+        case "${_v#v}" in
+            *[!0-9.]*|*.*.*.*|*..*|.*|*.) return 1 ;;
+            *[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 1 ;;
+            *.*.*) ;;
+            *) return 1 ;;
+        esac
+    done
+    _a="${1#v}"; _b="${2#v}"
+    _a1="${_a%%.*}"; _a="${_a#*.}"; _a2="${_a%%.*}"; _a3="${_a#*.}"
+    _b1="${_b%%.*}"; _b="${_b#*.}"; _b2="${_b%%.*}"; _b3="${_b#*.}"
+    if [ "$_a1" -ne "$_b1" ]; then [ "$_a1" -gt "$_b1" ]; return; fi
+    if [ "$_a2" -ne "$_b2" ]; then [ "$_a2" -gt "$_b2" ]; return; fi
+    [ "$_a3" -ge "$_b3" ]
+}
+
 # A served installer has all three values filled. A leftover placeholder means the server
 # that sent this script did not render it — refuse before touching anything. The marker
 # is spelled "@""@" so this file carries no literal one outside the three placeholders.
@@ -124,6 +147,27 @@ case "$SIGNING_PUBKEY" in
         exit 1
         ;;
 esac
+# Every ECDSA P-256 SubjectPublicKeyInfo is 124 base64 characters behind the same fixed
+# algorithm header. Any other key could never verify a release signature, so say that here
+# rather than after the downloads as "signature does NOT verify".
+P256_HEADER="MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE"
+if [ "${#SIGNING_PUBKEY}" -ne 124 ] || [ "${SIGNING_PUBKEY#"$P256_HEADER"}" = "$SIGNING_PUBKEY" ]; then
+    printf '%b' "${RED}This installer's signing key is not an ECDSA P-256 public key.${NC}\n"
+    exit 1
+fi
+# Checked here, not only at the floor comparison: there a malformed minimum reads as
+# "older than this installer's minimum" for every release.
+if ! version_ge "$MIN_VERSION" v0.0.0; then
+    printf '%b' "${RED}This installer carries a malformed minimum version.${NC}\n"
+    exit 1
+fi
+# A pin names one release directory on the download host; anything but vX.Y.Z (a path, a
+# bare 1.3.0) would ask for some other directory or one that does not exist.
+if [ "$VERSION" != latest ] && ! version_ge "$VERSION" v0.0.0; then
+    printf '%b' "${RED}--version must be latest or vX.Y.Z, got:${NC} "
+    printf '%s\n' "$VERSION"
+    exit 1
+fi
 
 # Check if running as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -354,6 +398,12 @@ if ! command -v openssl >/dev/null 2>&1; then
     printf '%b' "Install it (apt-get install -y openssl / dnf install -y openssl) and re-run.\n"
     exit 1
 fi
+# fold wraps the embedded key into the PEM lines openssl reads; without it the key block
+# is empty and set -e kills the run after the downloads with no message.
+if ! command -v fold >/dev/null 2>&1; then
+    printf '%b' "${RED}fold (coreutils) is required but not installed.${NC}\n"
+    exit 1
+fi
 # systemd is the only supported init: the agent's security model is its sandboxed unit.
 # Checked before ANY side effect, so an OpenRC host or a container without systemd gets a
 # clear refusal instead of a half-install that already holds the API key.
@@ -510,29 +560,6 @@ if ! openssl dgst -sha256 -verify "$TMP_PUB" -signature "$TMP_SIG" "$TMP_SUMS" >
     printf '%b' "${RED}❌ SHA256SUMS signature does NOT verify: nothing installed; any existing agent is untouched.${NC}\n"
     exit 1
 fi
-
-# version_ge A B: true when release A >= release B. Both must be vMAJOR.MINOR.PATCH with
-# numeric parts of at most 9 digits; anything else is false, so a malformed version fails
-# closed. Compared per component as integers: v1.10.0 is newer than v1.9.0. The digit cap
-# keeps every component inside the shell's integer range: a longer one makes `[` error out,
-# and inside `if` that error reads as "not equal" and falls through to the next component.
-version_ge() {
-    for _v in "$1" "$2"; do
-        case "$_v" in v?*) ;; *) return 1 ;; esac
-        case "${_v#v}" in
-            *[!0-9.]*|*.*.*.*|*..*|.*|*.) return 1 ;;
-            *[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 1 ;;
-            *.*.*) ;;
-            *) return 1 ;;
-        esac
-    done
-    _a="${1#v}"; _b="${2#v}"
-    _a1="${_a%%.*}"; _a="${_a#*.}"; _a2="${_a%%.*}"; _a3="${_a#*.}"
-    _b1="${_b%%.*}"; _b="${_b#*.}"; _b2="${_b%%.*}"; _b3="${_b#*.}"
-    if [ "$_a1" -ne "$_b1" ]; then [ "$_a1" -gt "$_b1" ]; return; fi
-    if [ "$_a2" -ne "$_b2" ]; then [ "$_a2" -gt "$_b2" ]; return; fi
-    [ "$_a3" -ge "$_b3" ]
-}
 
 # verify <downloaded path> <name as listed in SHA256SUMS>. Exact field match via awk, so a
 # name that is a suffix of another cannot be confused; a missing entry leaves EXPECTED

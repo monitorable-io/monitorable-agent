@@ -77,10 +77,10 @@ raw "cat > /root/mirror-build.sh" < scripts/install-test-mirror-build.sh
 trap 'raw "systemctl stop install-test-mirror >/dev/null 2>&1" || true; if [ -n "$SSH_CTL" ]; then ssh -o ControlPath="$SSH_CTL/c" -O exit "$SSH_DEST" 2>/dev/null; rm -rf "$SSH_CTL"; fi' EXIT
 run "systemctl stop install-test-mirror >/dev/null 2>&1; systemd-run --quiet --collect --unit=install-test-mirror python3 /root/install-test-mirror.py"
 
-# render <base url> <path in container> [<min version>]: fill the placeholders the way the
-# backend (BASE_URL, SIGNING_PUBKEY) and the vendoring step (MIN_VERSION) do.
+# render <base url> <path in container> [<min version> [<signing key>]]: fill the
+# placeholders the way publish-dist.sh does.
 render() {
-    sed -e "s|@@BASE_URL@@|$1|g" -e "s|@@SIGNING_PUBKEY@@|$TEST_PUB|g" -e "s|@@MIN_VERSION@@|${3:-$MIN}|g" \
+    sed -e "s|@@BASE_URL@@|$1|g" -e "s|@@SIGNING_PUBKEY@@|${4:-$TEST_PUB}|g" -e "s|@@MIN_VERSION@@|${3:-$MIN}|g" \
         distribution/install.sh | raw "cat > $2"
 }
 
@@ -153,6 +153,31 @@ rc=$(run_rc "unshare -m sh -c 'mount --bind /dev/null \"\$(command -v openssl)\"
 check no-openssl-refused '[ "$rc" = 1 ] && out_has "openssl is required" && ! run "test -e /opt/monitorable || getent passwd monitorable"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
+# No fold (it wraps the embedded key into PEM lines): refused before any side effect, the
+# same way as openssl above.
+rc=$(run_rc "unshare -m sh -c 'mount --bind /dev/null \"\$(command -v fold)\" && ! command -v fold >/dev/null && exec sh /root/install.sh --endpoint=$ENDPOINT --api-key=$KEY'")
+check no-fold-refused '[ "$rc" = 1 ] && out_has "fold (coreutils) is required" && ! run "test -e /opt/monitorable || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# The embedded key must be an ECDSA P-256 one: an Ed25519 key, or a P-256 key cut short,
+# is refused before any side effect instead of surfacing as a failed signature.
+ED_PUB="$(raw "openssl genpkey -algorithm ed25519 | openssl pkey -pubout" | grep -v -- '-----' | tr -d '\n')"
+render "$ORIGIN/good" /root/install-ed25519.sh "$MIN" "$ED_PUB"
+render "$ORIGIN/good" /root/install-shortkey.sh "$MIN" "${TEST_PUB%????}"
+rc=$(run_rc "sh /root/install-ed25519.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check non-p256-key-refused '[ -n "$ED_PUB" ] && [ "$rc" = 1 ] && out_has "not an ECDSA P-256 public key" && ! run "test -e /opt/monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+rc=$(run_rc "sh /root/install-shortkey.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check short-p256-key-refused '[ "$rc" = 1 ] && out_has "not an ECDSA P-256 public key" && ! run "test -e /opt/monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A rendered MIN_VERSION that is not vX.Y.Z is refused before any side effect, never
+# reported as "older than this installer's minimum".
+render "$ORIGIN/good" /root/install-badmin.sh v1.3
+rc=$(run_rc "sh /root/install-badmin.sh --endpoint=$ENDPOINT --api-key=$KEY")
+check malformed-min-version-refused '[ "$rc" = 1 ] && out_has "malformed minimum version" && ! out_has "older than" && ! run "test -e /opt/monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
 # Replay: validly signed sums for a release below the installer's floor are refused.
 run "sh /root/mirror-build.sh old v1.2.9 ok ok"
 render "$ORIGIN/old" /root/install-old.sh
@@ -185,14 +210,16 @@ rc=$(run_rc "sh /root/install-pinned.sh --version=v1.3.0 --endpoint=$ENDPOINT --
 check pinned-version-match-installs '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
-# A path-shaped --version resolves to latest/ on the server; the pin still refuses it.
-# curl and the mirror's http.server both normalize "otel/../latest" down to "latest"
-# (RFC 3986 dot-segment removal), so the request actually lands one level up from the
-# usual otel/<version>/ layout; stage the same genuine, correctly signed v1.3.0 bundle
-# there so the download succeeds and the pin check is what refuses it.
-run "sh /root/mirror-build.sh good $MIN ok ok ../latest"
+# A --version that is neither latest nor vX.Y.Z is refused before any side effect: a
+# path-shaped one would otherwise resolve to another directory on the server (curl
+# normalizes "otel/../latest" to "latest"), and a bare 1.3.0 to one that does not exist.
 rc=$(run_rc "sh /root/install.sh --version=../latest --endpoint=$ENDPOINT --api-key=$KEY")
-check dotdot-version-refused '[ "$rc" = 1 ] && out_has "not the requested ../latest" && ! run "test -e /opt/monitorable/monitorable-agent"'
+check dotdot-version-refused '[ "$rc" = 1 ] && out_has "--version must be latest or vX.Y.Z" && ! run "test -e /opt/monitorable"'
+rc=$(run_rc "sh /root/install.sh --version=1.3.0 --endpoint=$ENDPOINT --api-key=$KEY")
+check unprefixed-version-refused '[ "$rc" = 1 ] && out_has "--version must be latest or vX.Y.Z" && ! run "test -e /opt/monitorable"'
+# An explicit --version=latest is the default, not a pin.
+rc=$(run_rc "sh /root/install.sh --version=latest --endpoint=$ENDPOINT --api-key=$KEY")
+check explicit-latest-installs '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent"'
 run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # Signed sums without exactly one version line fail closed.
