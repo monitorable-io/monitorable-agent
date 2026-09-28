@@ -27,7 +27,7 @@ Version-controlled source for the Monitorable agent distribution served at the
   where it's implemented; a `VAR=x curl … | sudo sh` prefix doesn't work either, since it
   sets the variable for `curl`, not for `sudo`. Where a root shell isn't available, `--api-key=`
   is the fallback, not an equal alternative. Other args: `--endpoint=` (optional; the backend always passes it),
-  `--version=` (optional). It migrates an install made under the previous names (binary
+  `--version=vX.Y.Z` (optional; default `latest`). It migrates an install made under the previous names (binary
   `monitorable-otelcol`, unit `monitorable-collector`) — the on-disk queue is kept.
 - `configs/linux/` — collector config, the `monitorable-agent.service` systemd unit
   (SMART capability, supplementary-group and `DeviceAllow=` placeholders substituted by
@@ -74,8 +74,10 @@ publish has verified the installer host serves this run's installer — see belo
 Around that check:
 
 - Nothing is touched before the preflights pass (root, Linux, amd64/arm64, `curl`,
-  `sha256sum`, `openssl`, a running systemd). A host without systemd is refused with zero
-  side effects.
+  `sha256sum`, `openssl`, `fold`, a running systemd). A host without systemd is refused with
+  zero side effects. So are an embedded key that is not an ECDSA P-256 public key, a
+  malformed `MIN_VERSION`, and a `--version=` that is neither `latest` nor `vX.Y.Z` — each
+  with its own message, never a failed signature or a failed download later on.
 - With an `https://` base URL every download is `--proto =https --tlsv1.2`, so a redirect
   cannot downgrade a transfer to cleartext. The dev `http://` origin keeps plain curl.
 - The output prints the verified binary's sha256. Each release's `SHA256SUMS` (and its
