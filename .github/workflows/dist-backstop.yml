@@ -1,0 +1,59 @@
+name: dist-backstop
+# Off-infra backstop for the published release: scripts/check-published-dist.sh against
+# prod every 15 minutes, reported to healthchecks.io (check installer-dist-prod), which
+# alerts on a failure ping and on missed pings. Spec: platform
+# docs/superpowers/specs/2026-09-28-installer-dist-backstop-design.md
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Which env's published release to check
+        type: choice
+        options: [prod, staging]
+        default: prod
+      selftest:
+        description: "fail = check against the OTHER env's key, to prove the alert path"
+        type: choice
+        options: [none, fail]
+        default: none
+permissions:
+  contents: read
+concurrency:
+  group: dist-backstop-${{ github.event_name == 'schedule' && 'prod' || inputs.env }}
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CHECK_ENV: ${{ github.event_name == 'schedule' && 'prod' || inputs.env }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the published release
+        id: check
+        # Worst case: 9 requests x (20s x 3 tries) per pass, two passes, plus the 180s
+        # re-check delay. The step, not the job, times out, so the ping still runs.
+        timeout-minutes: 25
+        env:
+          CHECK_KEY_FILE: ${{ inputs.selftest == 'fail' && format('distribution/keys/{0}.pub', inputs.env == 'prod' && 'staging' || 'prod') || '' }}
+          CHECK_RETRY_DELAY: ${{ inputs.selftest == 'fail' && '0' || '' }}
+        # shell: bash (explicit) runs with -o pipefail, so tee does not hide the exit status.
+        shell: bash
+        run: scripts/check-published-dist.sh "$CHECK_ENV" 2>&1 | tee "$RUNNER_TEMP/backstop.log"
+      - name: Report to healthchecks.io
+        # Prod only, and only from main: a run of a branch's copy of this file never pings.
+        if: always() && env.CHECK_ENV == 'prod' && github.ref == 'refs/heads/main'
+        env:
+          HC_PING_URL: ${{ secrets.HC_PING_URL_DIST }}
+          OUTCOME: ${{ steps.check.outcome }}
+        run: |
+          if [ -z "$HC_PING_URL" ]; then
+            echo "HC_PING_URL_DIST is not set: not pinging"; exit 0
+          fi
+          log="$RUNNER_TEMP/backstop.log"
+          [ -s "$log" ] || echo "no output: the check step ended as '$OUTCOME'" > "$log"
+          rc=0; [ "$OUTCOME" = success ] || rc=1
+          curl -fsS -m 10 --retry 3 --data-binary @"$log" "$HC_PING_URL/$rc" > /dev/null
+          echo "pinged healthchecks.io with exit status $rc"
