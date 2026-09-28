@@ -44,7 +44,13 @@ jobs:
         run: scripts/check-published-dist.sh "$CHECK_ENV" 2>&1 | tee "$RUNNER_TEMP/backstop.log"
       - name: Report to healthchecks.io
         # Prod only, and only from main: a run of a branch's copy of this file never pings.
-        if: always() && env.CHECK_ENV == 'prod' && github.ref == 'refs/heads/main'
+        # Only a check that actually ran (passed, failed, or timed out, which is a failure)
+        # reports: a GitHub-side failure before it (checkout) or a cancelled run sends
+        # nothing, so it surfaces as a missed ping ("backstop stopped"), never as a false
+        # installer alarm.
+        if: >-
+          always() && env.CHECK_ENV == 'prod' && github.ref == 'refs/heads/main' &&
+          (steps.check.outcome == 'success' || steps.check.outcome == 'failure')
         env:
           HC_PING_URL: ${{ secrets.HC_PING_URL_DIST }}
           OUTCOME: ${{ steps.check.outcome }}
