@@ -5,7 +5,10 @@ name: dist-backstop
 # docs/superpowers/specs/2026-09-28-installer-dist-backstop-design.md
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # Every 15 minutes, off the top of the hour: GitHub delays, and under heavy load drops,
+    # scheduled runs at :00 (docs: "schedule workflows at times other than the top of the
+    # hour"). The */15 original never fired once in its first 2h20m.
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       env:
@@ -33,7 +36,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check the published release
         id: check
-        # Worst case: 9 requests x (20s x 3 tries) per pass, two passes, plus the 180s
+        # Worst case: 8 requests x (20s x 3 tries) per pass, two passes, plus the 180s
         # re-check delay. The step, not the job, times out, so the ping still runs.
         timeout-minutes: 25
         env:
