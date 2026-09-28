@@ -108,6 +108,14 @@ before the host demonstrably has it. Verify a release yourself:
 `openssl dgst -sha256 -verify distribution/keys/prod.pub -signature SHA256SUMS.sig SHA256SUMS`.
 Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the platform repo.
 
+**Off-infra backstop.** `.github/workflows/dist-backstop.yml` runs
+`scripts/check-published-dist.sh prod` every 15 minutes: the installer and its key and
+`MIN_VERSION`, the `openssl` signature check of the served `SHA256SUMS` against the
+committed `keys/prod.pub`, `latest.json` = the signed version, the config and unit hashes,
+and a HEAD of each binary. It reports to healthchecks.io (check `installer-dist-prod`).
+Run it by hand with `gh workflow run dist-backstop.yml -f env=staging` (or `prod`); the
+harness is `scripts/test-check-published-dist.sh`.
+
 ## Publishing
 
 ```bash

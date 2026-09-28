@@ -34,7 +34,8 @@ jobs:
             echo "shellcheck not found on runner" >&2
             exit 1
           fi
-          shellcheck distribution/install.sh distribution/install-stub.sh scripts/publish-dist.sh
+          shellcheck distribution/install.sh distribution/install-stub.sh scripts/publish-dist.sh \
+            scripts/check-published-dist.sh scripts/test-check-published-dist.sh
       - name: Signing dry-run (publish-dist.sh --render-only with a throwaway key)
         run: |
           set -eu
@@ -172,6 +173,8 @@ jobs:
           # and the --preflight `s3 s3 cp` don't match `put<space>…install.sh`, so this stays
           # at exactly one on the current script.
           test "$(grep -cE '^[[:space:]]*put[[:space:]].*install\.sh' scripts/publish-dist.sh)" -eq 1
+      - name: Distribution backstop checker (scripts/test-check-published-dist.sh)
+        run: scripts/test-check-published-dist.sh
       - name: Cross-compile smoke (linux amd64+arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/agent-amd64 ./cmd/monitorable-agent
