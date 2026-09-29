@@ -3,12 +3,13 @@ name: dist-backstop
 # prod every 15 minutes, reported to healthchecks.io (check installer-dist-prod), which
 # alerts on a failure ping and on missed pings. Spec: platform
 # docs/superpowers/specs/2026-09-28-installer-dist-backstop-design.md
+#
+# Triggered only by workflow_dispatch: every 15 minutes by a systemd timer on a host
+# outside our infrastructure (scripts/dist-backstop-dispatch/), plus by hand. There is no
+# schedule: trigger on purpose. GitHub's cron never fired at all for its first 6 hours, then
+# fired 2 of 42 slots overnight; and a second, sporadic trigger would turn "the timer
+# stopped" into a check that flaps up and down instead of staying down.
 on:
-  schedule:
-    # Every 15 minutes, off the top of the hour: GitHub delays, and under heavy load drops,
-    # scheduled runs at :00 (docs: "schedule workflows at times other than the top of the
-    # hour"). The */15 original never fired once in its first 2h20m.
-    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       env:
@@ -24,14 +25,14 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: dist-backstop-${{ github.event_name == 'schedule' && 'prod' || inputs.env }}
+  group: dist-backstop-${{ inputs.env }}
   cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      CHECK_ENV: ${{ github.event_name == 'schedule' && 'prod' || inputs.env }}
+      CHECK_ENV: ${{ inputs.env }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check the published release

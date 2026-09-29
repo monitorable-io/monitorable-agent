@@ -35,7 +35,8 @@ jobs:
             exit 1
           fi
           shellcheck distribution/install.sh distribution/install-stub.sh scripts/publish-dist.sh \
-            scripts/check-published-dist.sh scripts/test-check-published-dist.sh
+            scripts/check-published-dist.sh scripts/test-check-published-dist.sh \
+            scripts/dispatch-dist-backstop.sh scripts/test-dispatch-dist-backstop.sh
       - name: Signing dry-run (publish-dist.sh --render-only with a throwaway key)
         run: |
           set -eu
@@ -175,6 +176,8 @@ jobs:
           test "$(grep -cE '^[[:space:]]*put[[:space:]].*install\.sh' scripts/publish-dist.sh)" -eq 1
       - name: Distribution backstop checker (scripts/test-check-published-dist.sh)
         run: scripts/test-check-published-dist.sh
+      - name: Distribution backstop trigger (scripts/test-dispatch-dist-backstop.sh)
+        run: scripts/test-dispatch-dist-backstop.sh
       - name: Cross-compile smoke (linux amd64+arm64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/agent-amd64 ./cmd/monitorable-agent

@@ -109,12 +109,15 @@ before the host demonstrably has it. Verify a release yourself:
 Design: `docs/superpowers/specs/2026-09-26-installer-signing-design.md` in the platform repo.
 
 **Off-infra backstop.** `.github/workflows/dist-backstop.yml` runs
-`scripts/check-published-dist.sh prod` every 15 minutes: the installer and its key and
-`MIN_VERSION`, the `openssl` signature check of the served `SHA256SUMS` against the
-committed `keys/prod.pub`, `latest.json` = the signed version, the config and unit hashes,
-and a HEAD of each binary. It reports to healthchecks.io (check `installer-dist-prod`).
-Run it by hand with `gh workflow run dist-backstop.yml -f env=staging` (or `prod`); the
-harness is `scripts/test-check-published-dist.sh`.
+`scripts/check-published-dist.sh prod` every 15 minutes. It checks the installer (with its
+key and `MIN_VERSION`), runs the `openssl` signature check of the served `SHA256SUMS`
+against the committed `keys/prod.pub`, confirms `latest.json` matches the signed version,
+compares the config and unit hashes, and sends a HEAD for each binary. It reports to
+healthchecks.io (check `installer-dist-prod`). The runs are started by a systemd timer on a
+host outside our infrastructure (`scripts/dist-backstop-dispatch/`), not by GitHub's cron,
+which dropped almost every slot. Run it by hand with
+`gh workflow run dist-backstop.yml -f env=staging` (or `prod`). The harnesses are
+`scripts/test-check-published-dist.sh` and `scripts/test-dispatch-dist-backstop.sh`.
 
 ## Publishing
 
