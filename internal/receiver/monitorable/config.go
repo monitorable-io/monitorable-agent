@@ -10,7 +10,11 @@ import (
 
 const (
 	defaultAddressProbeInterval = time.Hour
-	minAddressProbeInterval     = 5 * time.Minute
+	// The backend hides a family not seen within 3 h before the server's last
+	// contact, so with the +/-10 % jitter an interval above roughly 2.7 h lets a
+	// dual-stack server's non-preferred family flicker out between probes. Keep
+	// the interval well under 3 h.
+	minAddressProbeInterval = 5 * time.Minute
 )
 
 // AddressProbeConfig drives the per-family address probe (internal/addressprobe).

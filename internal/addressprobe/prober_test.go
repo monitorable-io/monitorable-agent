@@ -2,9 +2,11 @@ package addressprobe
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,9 +102,12 @@ func TestLogsOnStateChangeOnly(t *testing.T) {
 		t.Fatalf("got %d warnings, want 1", w)
 	}
 	for _, e := range logs.All() {
-		for _, f := range e.Context {
-			if f.String == "secret-key" {
-				t.Fatal("API key logged")
+		if strings.Contains(e.Message, "secret-key") {
+			t.Fatalf("API key in log message: %q", e.Message)
+		}
+		for k, v := range e.ContextMap() {
+			if strings.Contains(fmt.Sprint(v), "secret-key") {
+				t.Fatalf("API key in log field %q: %v", k, v)
 			}
 		}
 	}
