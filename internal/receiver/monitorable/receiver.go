@@ -515,10 +515,6 @@ func (r *metricsReceiver) addCachedResourceAttributes(attrs pcommon.Map) {
 
 	// Add cached network info attributes
 	if r.cachedNetworkInfo != nil {
-		if r.cachedNetworkInfo.PrivateIP != "" {
-			attrs.PutStr("system.network.ip.private", r.cachedNetworkInfo.PrivateIP)
-		}
-
 		// Add MAC addresses for interfaces (limit to first 3)
 		for i, iface := range r.cachedNetworkInfo.Interfaces {
 			if i < 3 {
