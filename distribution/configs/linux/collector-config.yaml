@@ -51,6 +51,14 @@ receivers:
     collection_interval: 60s
     capability_interval: 24h
 
+    # Announces this server over IPv4 and IPv6 (an empty POST /v1/probe, hourly)
+    # so the dashboard can show both addresses. Same endpoint and key as the
+    # exporter below.
+    address_probe:
+      endpoint: "${MONITORABLE_ENDPOINT}"
+      api_key: "${MONITORABLE_API_KEY}"
+      interval: 1h
+
 processors:
   batch:
     # The batch processor controls how often data is sent to the backend.

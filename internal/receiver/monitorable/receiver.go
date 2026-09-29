@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/monitorable-io/monitorable-agent/internal/addressprobe"
 	"github.com/monitorable-io/monitorable-agent/internal/capabilities"
 	"github.com/monitorable-io/monitorable-agent/internal/collectors"
 	"github.com/monitorable-io/monitorable-agent/internal/sensors"
@@ -172,6 +173,19 @@ func (r *metricsReceiver) Start(ctx context.Context, host component.Host) error 
 	// Start capability re-detection goroutine
 	r.wg.Add(1)
 	go r.redetectCapabilities(ctx)
+
+	if ap := r.cfg.AddressProbe; ap.Endpoint != "" {
+		prober := addressprobe.New(addressprobe.Config{
+			Endpoint: ap.Endpoint,
+			APIKey:   string(ap.APIKey),
+			Interval: ap.Interval,
+		}, r.logger.Named("address_probe"))
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			prober.Run(ctx)
+		}()
+	}
 
 	return nil
 }

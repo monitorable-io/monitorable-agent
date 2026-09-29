@@ -37,6 +37,7 @@ func createDefaultConfig() component.Config {
 			Interval: defaultSystemdInterval,
 			Timeout:  defaultSystemdTimeout,
 		},
+		AddressProbe: AddressProbeConfig{Interval: defaultAddressProbeInterval},
 	}
 }
 
