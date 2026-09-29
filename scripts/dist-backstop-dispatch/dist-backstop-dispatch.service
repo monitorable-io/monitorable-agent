@@ -1,0 +1,40 @@
+# Starts one prod run of the dist-backstop workflow (scripts/dispatch-dist-backstop.sh).
+# Installed on a host OUTSIDE our infrastructure; see scripts/dist-backstop-dispatch/README.md.
+[Unit]
+Description=Dispatch the dist-backstop workflow (off-infra check of the published prod release)
+Documentation=https://github.com/monitorable-io/monitorable-agent/blob/main/scripts/dist-backstop-dispatch/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/dist-backstop/dispatch-dist-backstop.sh
+# The token is copied into a private per-run directory ($CREDENTIALS_DIRECTORY) readable
+# only by this run's throwaway user; the file under /etc stays root-only.
+LoadCredential=github-token:/etc/dist-backstop/github-token
+DynamicUser=yes
+TimeoutStartSec=2min
+# Hardening: it only needs to make one outbound HTTPS request.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077

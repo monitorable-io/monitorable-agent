@@ -1,0 +1,12 @@
+# Every 15 minutes, at :02/:17/:32/:47. The workflow's healthchecks.io check
+# (installer-dist-prod: period 15 min, grace 45 min) pages when runs stop arriving.
+[Unit]
+Description=Dispatch the dist-backstop workflow every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:02/15:00
+AccuracySec=1s
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target
