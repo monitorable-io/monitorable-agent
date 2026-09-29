@@ -57,6 +57,10 @@ func TestParseOSRelease(t *testing.T) {
 // the function must return false either way — pinning the one case actually
 // exercisable without root/fixture injection.
 func TestIsRebootRequired_NoSentinelFiles(t *testing.T) {
+	// A dev box with a pending reboot really has the sentinel; true is then correct.
+	if _, err := os.Stat("/var/run/reboot-required"); err == nil {
+		t.Skip("host has /var/run/reboot-required (reboot pending); the no-sentinel case is not exercisable here")
+	}
 	c := NewSystemInfoCollector(nil)
 	if c.isRebootRequired() {
 		t.Error("isRebootRequired() = true, want false (no reboot-required sentinel present in test env)")
