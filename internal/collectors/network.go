@@ -13,7 +13,6 @@ type NetworkInfoCollector struct{}
 // NetworkInfo holds network information
 type NetworkInfo struct {
 	Interfaces []NetworkInterface
-	PrivateIP  string
 }
 
 // NetworkInterface represents a network interface
@@ -33,8 +32,6 @@ func (c *NetworkInfoCollector) Collect() *NetworkInfo {
 	if interfaces, err := c.getNetworkInterfaces(); err == nil {
 		info.Interfaces = interfaces
 	}
-
-	info.PrivateIP = c.getPrivateIP()
 
 	return info
 }
@@ -60,61 +57,6 @@ func (c *NetworkInfoCollector) getNetworkInterfaces() ([]NetworkInterface, error
 	}
 
 	return interfaces, nil
-}
-
-// getPrivateIP gets the first private IP address
-func (c *NetworkInfoCollector) getPrivateIP() string {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-
-	for _, iface := range interfaces {
-		// Skip loopback interfaces
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				if ipnet.IP.To4() != nil { // IPv4 only
-					ip := ipnet.IP.String()
-					if c.isPrivateIP(ip) {
-						return ip
-					}
-				}
-			}
-		}
-	}
-
-	return ""
-}
-
-// isPrivateIP checks if an IP address is private
-func (c *NetworkInfoCollector) isPrivateIP(ip string) bool {
-	privateRanges := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-	}
-
-	for _, cidr := range privateRanges {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-
-		if network.Contains(net.ParseIP(ip)) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // CloudInfoCollector collects cloud provider information. Detection reads real DMI/
