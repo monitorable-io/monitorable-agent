@@ -5,7 +5,22 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configopaque"
 )
+
+const (
+	defaultAddressProbeInterval = time.Hour
+	minAddressProbeInterval     = 5 * time.Minute
+)
+
+// AddressProbeConfig drives the per-family address probe (internal/addressprobe).
+// The shipped config fills Endpoint/APIKey from the same env vars as the
+// exporter; an empty Endpoint turns the probe off.
+type AddressProbeConfig struct {
+	Endpoint string              `mapstructure:"endpoint"`
+	APIKey   configopaque.String `mapstructure:"api_key"`
+	Interval time.Duration       `mapstructure:"interval"`
+}
 
 // Docker collection modes.
 const (
@@ -79,6 +94,9 @@ type Config struct {
 
 	// SMART disk-health snapshot (self-detecting; sampled on a slow cadence)
 	Smart SmartConfig `mapstructure:"smart"`
+
+	// Address probe (announces the server over IPv4 and IPv6; off without an endpoint)
+	AddressProbe AddressProbeConfig `mapstructure:"address_probe"`
 }
 
 var _ component.Config = (*Config)(nil)
@@ -137,6 +155,12 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Smart.Timeout <= 0 {
 		cfg.Smart.Timeout = defaultSmartTimeout
+	}
+	if cfg.AddressProbe.Interval == 0 {
+		cfg.AddressProbe.Interval = defaultAddressProbeInterval
+	}
+	if cfg.AddressProbe.Interval < minAddressProbeInterval {
+		return fmt.Errorf("monitorable: address_probe.interval %v is below the %v minimum", cfg.AddressProbe.Interval, minAddressProbeInterval)
 	}
 	return nil
 }

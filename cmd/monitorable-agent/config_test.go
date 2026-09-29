@@ -4,7 +4,10 @@ import (
 	"path/filepath"
 	"testing"
 
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/otelcol/otelcoltest"
+
+	"github.com/monitorable-io/monitorable-agent/internal/receiver/monitorable"
 )
 
 // TestShippedConfigsLoad loads the published distribution configs through the
@@ -18,7 +21,19 @@ func TestShippedConfigsLoad(t *testing.T) {
 	t.Setenv("MONITORABLE_STATE_DIR", t.TempDir())
 
 	path := filepath.Join("..", "..", "distribution", "configs", "linux", "collector-config.yaml")
-	if _, err := otelcoltest.LoadConfigAndValidate(path, newFactories()); err != nil {
+	cfg, err := otelcoltest.LoadConfigAndValidate(path, newFactories())
+	if err != nil {
 		t.Fatalf("linux config failed to load: %v", err)
+	}
+
+	rc, ok := cfg.Receivers[component.MustNewID("monitorable")].(*monitorable.Config)
+	if !ok {
+		t.Fatal("monitorable receiver config missing or of the wrong type")
+	}
+	if rc.AddressProbe.Endpoint != "http://127.0.0.1:4318" {
+		t.Errorf("address_probe.endpoint = %q, want the exporter endpoint", rc.AddressProbe.Endpoint)
+	}
+	if string(rc.AddressProbe.APIKey) != "test-key" {
+		t.Errorf("address_probe.api_key does not carry the exporter key")
 	}
 }

@@ -13,6 +13,7 @@ require (
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver v0.161.0
 	github.com/shirou/gopsutil/v4 v4.26.8
 	go.opentelemetry.io/collector/component v1.67.0
+	go.opentelemetry.io/collector/config/configopaque v1.67.0
 	go.opentelemetry.io/collector/confmap v1.67.0
 	go.opentelemetry.io/collector/confmap/provider/envprovider v1.67.0
 	go.opentelemetry.io/collector/confmap/provider/fileprovider v1.67.0
@@ -125,7 +126,6 @@ require (
 	go.opentelemetry.io/collector/config/confighttp v0.161.0 // indirect
 	go.opentelemetry.io/collector/config/configmiddleware v1.67.0 // indirect
 	go.opentelemetry.io/collector/config/confignet v1.67.0 // indirect
-	go.opentelemetry.io/collector/config/configopaque v1.67.0 // indirect
 	go.opentelemetry.io/collector/config/configoptional v1.67.0 // indirect
 	go.opentelemetry.io/collector/config/configretry v1.67.0 // indirect
 	go.opentelemetry.io/collector/config/configtelemetry v0.161.0 // indirect
