@@ -56,7 +56,9 @@ version_ge() {
     [ "$_a3" -ge "$_b3" ]
 }
 
-CURL=(curl --proto "$PROTO" -fsS --max-time 20 --retry 2 -A "monitorable-dist-backstop/1")
+# --retry-all-errors: plain --retry skips connection resets (curl 35/56), which the edge
+# throws now and then. A retry cannot pass a wrong file: every check judges the content.
+CURL=(curl --proto "$PROTO" -fsS --max-time 20 --retry 2 --retry-all-errors -A "monitorable-dist-backstop/1")
 # fetch <url> <file>: 0 on a 2xx body saved to <file>; otherwise curl's error in $FETCH_ERR.
 fetch() {
     FETCH_ERR="$("${CURL[@]}" -o "$2" "$1" 2>&1)" && return 0
