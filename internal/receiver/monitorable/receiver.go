@@ -68,17 +68,15 @@ type metricsReceiver struct {
 	cachedSystemInfo   *collectors.SystemInfo
 	cachedHardwareSpec *collectors.HardwareSpec
 	cachedCloudInfo    *collectors.CloudInfo
-	cachedNetworkInfo  *collectors.NetworkInfo
 	metadataMutex      sync.RWMutex
 }
 
 // collectorSet holds all the metric collectors
 type collectorSet struct {
-	systemInfo  *collectors.SystemInfoCollector
-	hwSpec      *collectors.HardwareSpecCollector
-	networkInfo *collectors.NetworkInfoCollector
-	cloudInfo   *collectors.CloudInfoCollector
-	cpuTime     *collectors.CPUTimeCollector
+	systemInfo *collectors.SystemInfoCollector
+	hwSpec     *collectors.HardwareSpecCollector
+	cloudInfo  *collectors.CloudInfoCollector
+	cpuTime    *collectors.CPUTimeCollector
 }
 
 // newMetricsReceiver creates a new metrics receiver. It runs uncancellable I/O
@@ -452,15 +450,14 @@ func (r *metricsReceiver) createFrequencyMetric(metrics pmetric.MetricSlice, fre
 
 func (r *metricsReceiver) initializeCollectors(logger *slog.Logger) *collectorSet {
 	return &collectorSet{
-		systemInfo:  collectors.NewSystemInfoCollector(logger),
-		hwSpec:      collectors.NewHardwareSpecCollector(),
-		networkInfo: collectors.NewNetworkInfoCollector(),
-		cloudInfo:   collectors.NewCloudInfoCollector(""), // "" → default sysRoot "/sys"
-		cpuTime:     collectors.NewCPUTimeCollector(),
+		systemInfo: collectors.NewSystemInfoCollector(logger),
+		hwSpec:     collectors.NewHardwareSpecCollector(),
+		cloudInfo:  collectors.NewCloudInfoCollector(""), // "" → default sysRoot "/sys"
+		cpuTime:    collectors.NewCPUTimeCollector(),
 	}
 }
 
-// refreshCachedMetadata collects and caches system metadata. None of the four
+// refreshCachedMetadata collects and caches system metadata. None of the three
 // collectors it calls can fail (they degrade internally to zero-value/"unknown"
 // fields and log their own swallowed failures where that matters), so there is
 // nothing for this method itself to report as an error.
@@ -470,14 +467,12 @@ func (r *metricsReceiver) refreshCachedMetadata() {
 	systemInfo := r.collectors.systemInfo.Collect()
 	hardwareSpec := r.collectors.hwSpec.Collect()
 	cloudInfo := r.collectors.cloudInfo.Collect()
-	networkInfo := r.collectors.networkInfo.Collect()
 
 	// Update cached metadata with lock
 	r.metadataMutex.Lock()
 	r.cachedSystemInfo = systemInfo
 	r.cachedHardwareSpec = hardwareSpec
 	r.cachedCloudInfo = cloudInfo
-	r.cachedNetworkInfo = networkInfo
 	r.metadataMutex.Unlock()
 
 	r.logger.Debug("Cached system metadata refreshed successfully",
@@ -525,17 +520,6 @@ func (r *metricsReceiver) addCachedResourceAttributes(attrs pcommon.Map) {
 	// for them was the bug this fix removes (see CloudInfo's doc comment).
 	if r.cachedCloudInfo != nil && r.cachedCloudInfo.Provider != "" {
 		attrs.PutStr("system.cloud.provider", r.cachedCloudInfo.Provider)
-	}
-
-	// Add cached network info attributes
-	if r.cachedNetworkInfo != nil {
-		// Add MAC addresses for interfaces (limit to first 3)
-		for i, iface := range r.cachedNetworkInfo.Interfaces {
-			if i < 3 {
-				key := fmt.Sprintf("system.network.interface.%d.mac", i)
-				attrs.PutStr(key, iface.MACAddress)
-			}
-		}
 	}
 
 	// Add permission error flags
