@@ -1,63 +1,10 @@
 package collectors
 
 import (
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
 )
-
-// NetworkInfoCollector collects network information
-type NetworkInfoCollector struct{}
-
-// NetworkInfo holds network information
-type NetworkInfo struct {
-	Interfaces []NetworkInterface
-}
-
-// NetworkInterface represents a network interface
-type NetworkInterface struct {
-	MACAddress string
-}
-
-// NewNetworkInfoCollector creates a new network info collector
-func NewNetworkInfoCollector() *NetworkInfoCollector {
-	return &NetworkInfoCollector{}
-}
-
-// Collect gathers network information
-func (c *NetworkInfoCollector) Collect() *NetworkInfo {
-	info := &NetworkInfo{}
-
-	if interfaces, err := c.getNetworkInterfaces(); err == nil {
-		info.Interfaces = interfaces
-	}
-
-	return info
-}
-
-// getNetworkInterfaces gets all network interfaces with MAC addresses
-func (c *NetworkInfoCollector) getNetworkInterfaces() ([]NetworkInterface, error) {
-	var interfaces []NetworkInterface
-
-	netInterfaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, iface := range netInterfaces {
-		// Skip loopback and down interfaces
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-
-		interfaces = append(interfaces, NetworkInterface{
-			MACAddress: iface.HardwareAddr.String(),
-		})
-	}
-
-	return interfaces, nil
-}
 
 // CloudInfoCollector collects cloud provider information. Detection reads real DMI/
 // hypervisor signals under sysRoot; there is no metadata-service call (that would be
