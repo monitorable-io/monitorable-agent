@@ -24,8 +24,14 @@ jobs:
       - run: go test -race ./...
       - name: gofmt
         run: gofmt -l . | tee /dev/stderr | (! read)
+      # staticcheck (2026.2.1 and master) cannot read Go 1.27.2 export data
+      # ("export data version 5 is greater than maximum supported version 4"),
+      # so it runs on the previous patch release until upstream catches up.
+      # go.mod's `go 1.27.0` admits 1.27.1; the `toolchain go1.27.2` line only
+      # sets the default, which an explicit GOTOOLCHAIN overrides.
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        env: { GOTOOLCHAIN: go1.27.1 }
       - name: deadcode
         run: test -z "$(go run golang.org/x/tools/cmd/deadcode@latest -test ./...)"
       - name: shellcheck
@@ -224,8 +230,12 @@ jobs:
       # Vulnerability scan over the full dependency graph (>1000 packages, incl. the
       # aws-sdk/k8s trees that otelconftelemetry links in). Reachability-based, so it
       # reports the ones actually callable from this binary.
+      # go-version-input, not go-version-file: the action's own setup-go reads only
+      # the `go` directive (1.27.0 → latest cached 1.27.x) and ignores the
+      # `toolchain` line, so stdlib findings fixed in 1.27.2 kept failing the scan.
+      # Keep this in step with go.mod's toolchain directive.
       - name: govulncheck
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
-          go-version-file: go.mod
+          go-version-input: 1.27.2
           repo-checkout: false
