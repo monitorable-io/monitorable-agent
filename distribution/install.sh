@@ -917,6 +917,6 @@ printf '%b' "${GREEN}   beyond the SMART ioctls your hardware needs).${NC}\n"
 
 printf '\n'
 printf '%b' "${BLUE}📚 For more information and troubleshooting:${NC}\n"
-printf '%b' "   https://monitorable.io/docs/collector/install/\n"
+printf '%b' "   https://monitorable.io/docs/agent/install/\n"
 printf '\n'
 printf '%b' "${GREEN}🎯 Welcome to OpenTelemetry-native monitoring with Monitorable!${NC}\n"

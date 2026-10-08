@@ -1,6 +1,6 @@
 [Unit]
 Description=Monitorable agent
-Documentation=https://monitorable.io/docs/collector/install/
+Documentation=https://monitorable.io/docs/agent/install/
 After=network-online.target
 Wants=network-online.target
 
