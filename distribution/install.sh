@@ -379,7 +379,7 @@ SERVICE_FILE_URL="$BASE_URL/configs/linux/$UNIT_FILE"
 
 printf '%b' "${BLUE}Detected platform:${NC} "
 printf '%s\n' "$OS/$ARCH"
-printf '%b' "${BLUE}Collector URL:${NC} "
+printf '%b' "${BLUE}Agent URL:${NC} "
 printf '%s\n' "$COLLECTOR_URL"
 printf '\n'
 
