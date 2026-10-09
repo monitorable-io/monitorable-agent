@@ -122,8 +122,9 @@ func fillNVMe(r *rawSmart, d *smart.NVMeDevice) error {
 	if err != nil {
 		return fmt.Errorf("NVMe Identify %s: %w", r.Device, err)
 	}
-	r.Model = ctrl.ModelNumber()
-	r.Serial = ctrl.SerialNumber()
+	if err := applyIdentity(r, ctrl.ModelNumber(), ctrl.SerialNumber()); err != nil {
+		return fmt.Errorf("NVMe Identify %w", err)
+	}
 	r.CapacityBytes = int64(ctrl.Tnvmcap.Val[0]) // lower 64 bits; >64 bit drives are future
 
 	// SMART log
@@ -184,8 +185,9 @@ func fillSATA(r *rawSmart, d *smart.SataDevice) error {
 	if err != nil {
 		return fmt.Errorf("ATA Identify %s: %w", r.Device, err)
 	}
-	r.Model = id.ModelNumber()
-	r.Serial = id.SerialNumber()
+	if err := applyIdentity(r, id.ModelNumber(), id.SerialNumber()); err != nil {
+		return fmt.Errorf("ATA Identify %w", err)
+	}
 
 	// Rotation rate: 0x0001 = non-rotating (SSD); 0 = not reported.
 	// Deliberately treating "not reported" (0) as SSD (zero value) since rotating
