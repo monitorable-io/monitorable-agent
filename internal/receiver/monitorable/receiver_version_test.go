@@ -13,13 +13,10 @@ import (
 // hardcoded service.version over the receiver's value; monitorable.agent.version
 // passes through old and new configs untouched.
 func TestAddCachedResourceAttributes_AgentVersion(t *testing.T) {
-	// capabilities must be non-nil: addCachedResourceAttributes unconditionally
-	// calls r.capDetector.GetErrorFlags(r.capabilities), which dereferences
-	// caps.CanReadTemperatures. In production this field is always populated
-	// by NewReceiver before this method ever runs; a bare &metricsReceiver{}
-	// hits that unrelated nil-pointer dereference before reaching the
-	// assertion below, so this test needs a zero-value (non-nil) capabilities.
-	r := &metricsReceiver{capabilities: &capabilities.SystemCapabilities{}}
+	// addCachedResourceAttributes calls r.capDetector.GetErrorFlags(r.capabilities);
+	// in production NewReceiver populates both before this method ever runs, so the
+	// test mirrors that rather than relying on nil-safety it does not promise.
+	r := &metricsReceiver{capabilities: &capabilities.SystemCapabilities{}, capDetector: capabilities.NewDetector()}
 	attrs := pcommon.NewMap()
 	r.addCachedResourceAttributes(attrs)
 
