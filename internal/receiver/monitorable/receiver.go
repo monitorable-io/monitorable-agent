@@ -3,7 +3,6 @@ package monitorable
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -522,10 +521,18 @@ func (r *metricsReceiver) addCachedResourceAttributes(attrs pcommon.Map) {
 		attrs.PutStr("system.cloud.provider", r.cachedCloudInfo.Provider)
 	}
 
-	// Add permission error flags
+	// Permission error flags, ALWAYS emitted as a JSON array ("[]" when none). Two
+	// reasons: fmt's %v of a slice is space-separated (`[a b]`), which the backend's
+	// comma split once stored as a single element holding every code; and the backend
+	// only rewrites server_metadata when a write-through field changed, so an agent that
+	// simply stopped sending the attribute left the old codes in Postgres until some
+	// other field moved. An explicit empty list is the change signal that clears them.
 	errorFlags := r.capDetector.GetErrorFlags(r.capabilities)
-	if len(errorFlags) > 0 {
-		attrs.PutStr("monitorable.permission_errors", fmt.Sprintf("%v", errorFlags))
+	if errorFlags == nil {
+		errorFlags = []string{}
+	}
+	if encoded, err := json.Marshal(errorFlags); err == nil {
+		attrs.PutStr("monitorable.permission_errors", string(encoded))
 	}
 }
 

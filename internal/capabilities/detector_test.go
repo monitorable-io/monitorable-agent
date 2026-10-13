@@ -88,13 +88,14 @@ func TestDetectAll_NoError(t *testing.T) {
 	}
 }
 
-func TestGetErrorFlags(t *testing.T) {
+// No capability maps to a permission code any more: unreadable temperature sensors
+// mean "no sensor" on a VM, not "no permission", so the flag that named root was
+// removed (see GetErrorFlags). Both detection outcomes must yield no code.
+func TestGetErrorFlags_NoCodeForMissingTemperatures(t *testing.T) {
 	d := NewDetector()
-	if flags := d.GetErrorFlags(&SystemCapabilities{CanReadTemperatures: true}); len(flags) != 0 {
-		t.Errorf("flags = %v, want none when temperatures readable", flags)
-	}
-	flags := d.GetErrorFlags(&SystemCapabilities{CanReadTemperatures: false})
-	if len(flags) != 1 || flags[0] != "temperature_monitoring_requires_root" {
-		t.Errorf("flags = %v, want [temperature_monitoring_requires_root]", flags)
+	for _, readable := range []bool{true, false} {
+		if flags := d.GetErrorFlags(&SystemCapabilities{CanReadTemperatures: readable}); len(flags) != 0 {
+			t.Errorf("GetErrorFlags(CanReadTemperatures=%v) = %v, want none", readable, flags)
+		}
 	}
 }

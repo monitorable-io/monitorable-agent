@@ -61,3 +61,25 @@ func TestAddCachedResourceAttributes_NoMACAddresses(t *testing.T) {
 		return true
 	})
 }
+
+// monitorable.permission_errors is always present and always a JSON array. With no
+// capability mapping to a code any more it is "[]" on every host — bare metal with
+// sensors and a VM without alike — and that explicit empty list is what lets the
+// backend clear codes an older agent left on the row (see addCachedResourceAttributes).
+func TestAddCachedResourceAttributes_PermissionErrorsIsEmptyJSONArray(t *testing.T) {
+	for _, readable := range []bool{true, false} {
+		r := &metricsReceiver{
+			capabilities: &capabilities.SystemCapabilities{CanReadTemperatures: readable},
+			capDetector:  capabilities.NewDetector(),
+		}
+		attrs := pcommon.NewMap()
+		r.addCachedResourceAttributes(attrs)
+		v, ok := attrs.Get("monitorable.permission_errors")
+		if !ok {
+			t.Fatalf("CanReadTemperatures=%v: monitorable.permission_errors missing, want \"[]\"", readable)
+		}
+		if v.Str() != "[]" {
+			t.Fatalf("CanReadTemperatures=%v: monitorable.permission_errors = %q, want \"[]\"", readable, v.Str())
+		}
+	}
+}

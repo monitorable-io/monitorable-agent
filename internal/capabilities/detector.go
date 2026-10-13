@@ -87,10 +87,14 @@ func (d *Detector) thermalZoneReadable() bool {
 // actual collector consumes get a flag — the disk_health/raid_status/zfs_status/
 // network_stats/smart_data/systemd_units flags all advertised unbuilt or
 // self-degrading features and were removed.
-func (d *Detector) GetErrorFlags(caps *SystemCapabilities) []string {
-	var errors []string
-	if !caps.CanReadTemperatures {
-		errors = append(errors, "temperature_monitoring_requires_root")
-	}
-	return errors
+//
+// temperature_monitoring_requires_root was removed too (2026-10-13): it fired whenever
+// no hwmon/thermal_zone sensor was READABLE, which on every VM means no sensor EXISTS.
+// Root never helped (sysfs temp*_input is world-readable where it exists) and the unit
+// never runs as root. So today no capability maps to a code, and the backend/dashboard
+// catalog that gates what the Permission limitations card shows is empty to match. A
+// code goes back in here only for a real EACCES case, together with the backend
+// (pkg/models/permission_errors.go) and dashboard catalog entries in the same release.
+func (d *Detector) GetErrorFlags(_ *SystemCapabilities) []string {
+	return nil
 }
