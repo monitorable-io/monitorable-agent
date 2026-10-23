@@ -63,6 +63,13 @@ type metricsReceiver struct {
 	smartPrev       collectors.SmartStatus
 	smartJSONWarned bool // WARN once per process lifetime when smart.disks exceeds maxSnapshotBytes
 
+	// Listening TCP ports snapshot (nil when ports.mode=off). Sampled by its own
+	// goroutine (runPortsSampler); snapshotted once per collection cycle.
+	portsCollector  *collectors.PortsCollector
+	portsMode       string
+	portsPrev       collectors.PortsStatus
+	portsJSONWarned bool // WARN once per process lifetime when listening.ports exceeds maxSnapshotBytes
+
 	// Cached system metadata (updated periodically, used in all OTLP payloads)
 	cachedSystemInfo   *collectors.SystemInfo
 	cachedHardwareSpec *collectors.HardwareSpec
@@ -140,6 +147,16 @@ func newMetricsReceiver(
 		r.smartCollector = collectors.NewSmartCollector()
 	}
 
+	// Listening TCP ports: self-sampling collector over /proc/net/tcp{,6} (nil when mode=off).
+	r.portsMode = cfg.Ports.Mode
+	if r.portsMode == "" {
+		r.portsMode = PortsModeAuto
+	}
+	r.portsPrev = collectors.PortsStatus(-1) // unset → first status always logs
+	if r.portsMode != PortsModeOff {
+		r.portsCollector = collectors.NewPortsCollector("/proc", "/etc/services", slogLogger)
+	}
+
 	// Initialize temperature collector with robust sensor support
 	r.tempCollector = sensors.NewTemperatureCollector(
 		cfg.PrimarySensor,
@@ -170,6 +187,11 @@ func (r *metricsReceiver) Start(ctx context.Context, host component.Host) error 
 	// Start capability re-detection goroutine
 	r.wg.Add(1)
 	go r.redetectCapabilities(ctx)
+
+	if r.portsCollector != nil {
+		r.wg.Add(1)
+		go r.runPortsSampler(ctx, r.cfg.Ports.SampleInterval)
+	}
 
 	if ap := r.cfg.AddressProbe; ap.Endpoint != "" {
 		prober := addressprobe.New(addressprobe.Config{
@@ -271,6 +293,9 @@ func (r *metricsReceiver) performUnifiedCollection(ctx context.Context) {
 	r.collectDockerContainers(ctx, resourceAttrs)
 
 	scopeMetrics := resourceMetrics.ScopeMetrics().AppendEmpty()
+
+	// Listening ports: the attribute and gauges ride this same batch.
+	r.collectListeningPorts(ctx, resourceAttrs, scopeMetrics.Metrics())
 
 	// Collect all metrics
 	r.collectCPUMetrics(scopeMetrics.Metrics())

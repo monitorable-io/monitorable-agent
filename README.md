@@ -13,6 +13,7 @@ OTLP/HTTP to a Monitorable ingest endpoint. There is no separate config to autho
 - CPU temperature and frequency
 - SMART disk health (tiered by detected hardware; see Security model below)
 - systemd unit snapshot
+- Listening TCP ports with established-connection counts (no addresses or processes)
 - Docker container snapshot (CPU/memory/network per container), when a Docker socket is
   present
 
