@@ -1,0 +1,10 @@
+# Network services, Internet style (test fixture in /etc/services format)
+tcpmux		1/tcp
+ssh		22/tcp				# SSH Remote Login Protocol
+ssh		22/udp
+sshd-dup	22/tcp
+domain		53/udp
+domain		53/tcp
+http		80/tcp		www	# WorldWideWeb HTTP
+bad		notaport/tcp
+bad2		99999/tcp
