@@ -55,6 +55,16 @@ internal/
   `monitorable.docker.{mode: auto|on|off, endpoint, excluded_images, timeout}`. The
   collector user must be in the `docker` group; if the socket is present but inaccessible
   the receiver logs an actionable WARN.
+- **Listening ports**: the `monitorable` receiver samples `/proc/net/tcp{,6}` every 10s
+  (LISTEN = state `0A`; connection counts = ESTABLISHED `01` only, keyed by local port) and,
+  once per 60s cycle, attaches the `listening.ports` resource attribute plus
+  `monitorable.port.connections{,.peak}` gauges (avg/peak over the window, `port` label) for the
+  30 lowest ports; `all_ports` lists up to 1000. No addresses, peers, PIDs or command lines.
+  Config: `monitorable.ports.{mode: auto|on|off, sample_interval, max_ports}`, defaults
+  auto/10s/30, bounds 5-60s / 1-100. No privilege needed. Known limitation: ports Docker
+  publishes via iptables DNAT (and kube-proxy NodePorts) keep their client connections in the
+  container's network namespace, so the host-side count reads near zero (docker-proxy holds the
+  LISTEN; a NodePort has no host listener at all).
 - **Persistent export queue (Linux)**: the `otlp_http` exporter retries forever
   (`max_elapsed_time: 0`) with a `file_storage`-backed persistent queue at
   `/var/lib/monitorable/queue` (1440 requests); `newFactories()` in

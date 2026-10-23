@@ -56,6 +56,27 @@ const (
 	defaultSmartTimeout  = 10 * time.Second
 )
 
+// Listening-ports collection modes.
+const (
+	PortsModeAuto = "auto" // sample every window; quiet when /proc/net/tcp is unreadable
+	PortsModeOn   = "on"   // sample every window; WARN when /proc/net/tcp is unreadable
+	PortsModeOff  = "off"  // never sample or emit
+
+	defaultPortsSampleInterval = 10 * time.Second
+	minPortsSampleInterval     = 5 * time.Second
+	maxPortsSampleInterval     = 60 * time.Second
+	defaultPortsMaxPorts       = 30
+	maxPortsMaxPorts           = 100
+)
+
+// PortsConfig controls the listening-TCP-ports snapshot (sampled from
+// /proc/net/tcp{,6}; no privilege needed).
+type PortsConfig struct {
+	Mode           string        `mapstructure:"mode"`            // auto | on | off
+	SampleInterval time.Duration `mapstructure:"sample_interval"` // /proc/net/tcp sampling cadence (5s-60s)
+	MaxPorts       int           `mapstructure:"max_ports"`       // detail rows (lowest ports) per snapshot (1-100)
+}
+
 // SystemdConfig controls in-receiver systemd service-snapshot collection.
 type SystemdConfig struct {
 	Mode     string        `mapstructure:"mode"`     // auto | on | off
@@ -98,6 +119,9 @@ type Config struct {
 
 	// SMART disk-health snapshot (self-detecting; sampled on a slow cadence)
 	Smart SmartConfig `mapstructure:"smart"`
+
+	// Listening TCP ports + ESTABLISHED connection counts (self-sampling; no privilege)
+	Ports PortsConfig `mapstructure:"ports"`
 
 	// Address probe (announces the server over IPv4 and IPv6; off without an endpoint)
 	AddressProbe AddressProbeConfig `mapstructure:"address_probe"`
@@ -159,6 +183,26 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Smart.Timeout <= 0 {
 		cfg.Smart.Timeout = defaultSmartTimeout
+	}
+	switch cfg.Ports.Mode {
+	case "":
+		cfg.Ports.Mode = PortsModeAuto
+	case PortsModeAuto, PortsModeOn, PortsModeOff:
+		// ok
+	default:
+		return fmt.Errorf("monitorable: invalid ports.mode %q (want auto|on|off)", cfg.Ports.Mode)
+	}
+	if cfg.Ports.SampleInterval == 0 {
+		cfg.Ports.SampleInterval = defaultPortsSampleInterval
+	}
+	if cfg.Ports.SampleInterval < minPortsSampleInterval || cfg.Ports.SampleInterval > maxPortsSampleInterval {
+		return fmt.Errorf("monitorable: ports.sample_interval %v is outside %v-%v", cfg.Ports.SampleInterval, minPortsSampleInterval, maxPortsSampleInterval)
+	}
+	if cfg.Ports.MaxPorts == 0 {
+		cfg.Ports.MaxPorts = defaultPortsMaxPorts
+	}
+	if cfg.Ports.MaxPorts < 1 || cfg.Ports.MaxPorts > maxPortsMaxPorts {
+		return fmt.Errorf("monitorable: ports.max_ports %d is outside 1-%d", cfg.Ports.MaxPorts, maxPortsMaxPorts)
 	}
 	if cfg.AddressProbe.Interval == 0 {
 		cfg.AddressProbe.Interval = defaultAddressProbeInterval

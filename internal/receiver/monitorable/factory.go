@@ -37,6 +37,11 @@ func createDefaultConfig() component.Config {
 			Interval: defaultSystemdInterval,
 			Timeout:  defaultSystemdTimeout,
 		},
+		Ports: PortsConfig{
+			Mode:           PortsModeAuto,
+			SampleInterval: defaultPortsSampleInterval,
+			MaxPorts:       defaultPortsMaxPorts,
+		},
 		AddressProbe: AddressProbeConfig{Interval: defaultAddressProbeInterval},
 	}
 }
