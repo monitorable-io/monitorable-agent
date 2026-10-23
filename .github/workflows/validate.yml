@@ -232,10 +232,10 @@ jobs:
       # reports the ones actually callable from this binary.
       # go-version-input, not go-version-file: the action's own setup-go reads only
       # the `go` directive (1.27.0 → latest cached 1.27.x) and ignores the
-      # `toolchain` line, so stdlib findings fixed in 1.27.2 kept failing the scan.
+      # `toolchain` line, so stdlib findings fixed in a newer patch kept failing the scan.
       # Keep this in step with go.mod's toolchain directive.
       - name: govulncheck
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
-          go-version-input: 1.27.2
+          go-version-input: 1.27.3
           repo-checkout: false
