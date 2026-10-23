@@ -3,6 +3,7 @@ package collectors
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -269,8 +270,37 @@ func TestPortsCollector_CancelledContext(t *testing.T) {
 	writeProcNet(t, root, []tcpRow{listenRow("0.0.0.0", 22)}, []tcpRow{})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := c.Sample(ctx, t0); err != context.Canceled {
+	if err := c.Sample(ctx, t0); !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+// expiresAfterFirstCheck reports a live context on the first Err call (the
+// pre-read check) and DeadlineExceeded afterwards, i.e. the deadline passes
+// while /proc is being read.
+type expiresAfterFirstCheck struct {
+	context.Context
+	calls int
+}
+
+func (c *expiresAfterFirstCheck) Err() error {
+	c.calls++
+	if c.calls == 1 {
+		return nil
+	}
+	return context.DeadlineExceeded
+}
+
+func TestPortsCollector_OverDeadlineSampleSkipped(t *testing.T) {
+	c, root := newTestPorts(t)
+	writeProcNet(t, root, []tcpRow{listenRow("0.0.0.0", 22)}, []tcpRow{})
+	ctx := &expiresAfterFirstCheck{Context: context.Background()}
+	if err := c.Sample(ctx, t0); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	res := c.Snapshot(30)
+	if res.Status != PortsUnreadable || !errors.Is(res.Err, context.DeadlineExceeded) {
+		t.Errorf("result = %+v, want PortsUnreadable (late sample not counted)", res)
 	}
 }
 

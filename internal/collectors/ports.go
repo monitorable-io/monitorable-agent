@@ -90,13 +90,17 @@ func NewPortsCollector(procRoot, servicesPath string, logger *slog.Logger) *Port
 }
 
 // Sample reads the socket tables and appends one sample to the window. A failed
-// read is not appended and its error is returned. A missing tcp6 file (IPv6
+// read, or one finishing after ctx expired, is not appended and its error is
+// returned. A missing tcp6 file (IPv6
 // disabled) is not an error; a missing tcp is.
 func (c *PortsCollector) Sample(ctx context.Context, now time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	listeners, established, err := c.readTables()
+	if err == nil {
+		err = ctx.Err() // a sample that overran its deadline is skipped
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
