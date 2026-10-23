@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/netip"
 	"strconv"
@@ -33,15 +34,21 @@ type listenerFacts struct {
 }
 
 // parseProcNetTCP parses /proc/net/tcp (v6=false) or /proc/net/tcp6 (v6=true).
-// The header and any malformed line are skipped (the header fails the same
-// local_address check), so a torn read yields the rows that did parse; only a
-// reader error is returned.
+// The header (first field "sl") is skipped and a malformed line is dropped, so a
+// torn read yields the rows that did parse. Two errors are returned: a reader
+// error, and a table with data lines of which none parse (an unknown format must
+// not read as "no listeners"). A header-only or empty table is not an error.
 func parseProcNetTCP(r io.Reader, v6 bool) ([]tcpRow, error) {
 	var rows []tcpRow
+	dataLines := 0
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		// sl local_address rem_address st ...
 		f := strings.Fields(sc.Text())
+		if len(f) == 0 || f[0] == "sl" {
+			continue
+		}
+		dataLines++
 		if len(f) < 4 {
 			continue
 		}
@@ -55,7 +62,13 @@ func parseProcNetTCP(r io.Reader, v6 bool) ([]tcpRow, error) {
 		}
 		rows = append(rows, tcpRow{Local: addr, LocalPort: port, State: uint8(st)})
 	}
-	return rows, sc.Err()
+	if err := sc.Err(); err != nil {
+		return rows, err
+	}
+	if dataLines > 0 && len(rows) == 0 {
+		return nil, fmt.Errorf("no parseable rows in %d data lines", dataLines)
+	}
+	return rows, nil
 }
 
 // parseLocalAddr decodes "HEXADDR:HEXPORT". The kernel prints the address as

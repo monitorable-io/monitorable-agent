@@ -3,6 +3,7 @@ package collectors
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -239,6 +240,40 @@ func TestPortsCollector_UnreadableTable(t *testing.T) {
 	res := c.Snapshot(30)
 	if res.Status != PortsUnreadable || res.Err == nil {
 		t.Errorf("result = %+v, want PortsUnreadable with Err", res)
+	}
+}
+
+func TestPortsCollector_EmptyTableIsAnOKEmptySnapshot(t *testing.T) {
+	c, root := newTestPorts(t)
+	writeProcNet(t, root, []tcpRow{}, []tcpRow{}) // headers only: a host with no listeners
+	sampleAt(t, c, 0)
+	res := c.Snapshot(30)
+	if res.Status != PortsOK || res.Snapshot == nil || len(res.Snapshot.Ports) != 0 {
+		t.Fatalf("result = %+v, want OK with no ports", res)
+	}
+	b, err := json.Marshal(res.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"all_ports":[]`) {
+		t.Errorf("json = %s, want all_ports: []", b)
+	}
+}
+
+func TestPortsCollector_AllMalformedTableSkipsSample(t *testing.T) {
+	c, root := newTestPorts(t)
+	if err := os.MkdirAll(filepath.Join(root, "net"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Unknown format: must not read as "no listeners" (the backend would drop every port).
+	if err := os.WriteFile(filepath.Join(root, "net", "tcp"), []byte("hdr\nnot a socket row\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Sample(context.Background(), t0); err == nil {
+		t.Fatal("Sample of an unparseable table returned nil")
+	}
+	if res := c.Snapshot(30); res.Status != PortsUnreadable || res.Err == nil {
+		t.Errorf("result = %+v, want PortsUnreadable", res)
 	}
 }
 

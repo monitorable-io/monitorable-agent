@@ -47,6 +47,9 @@ func TestParseProcNetTCP_V6(t *testing.T) {
 	want := []tcpRow{
 		{netip.IPv6Unspecified(), 443, tcpStateListen},
 		{netip.MustParseAddr("::ffff:10.0.0.5"), 443, tcpStateEstablished},
+		{netip.MustParseAddr("::1"), 5432, tcpStateListen},
+		{netip.MustParseAddr("::ffff:127.0.0.1"), 6379, tcpStateListen},
+		{netip.MustParseAddr("2001:db8::1"), 8080, tcpStateListen}, // pins the high words
 	}
 	if len(rows) != len(want) {
 		t.Fatalf("got %d rows, want %d: %+v", len(rows), len(want), rows)
@@ -56,6 +59,12 @@ func TestParseProcNetTCP_V6(t *testing.T) {
 			t.Errorf("row %d = %+v, want %+v", i, rows[i], want[i])
 		}
 	}
+	// Decoded through the parser (no test-side encoder): loopback forms vs global.
+	for i, wantLoop := range map[int]bool{2: true, 3: true, 4: false} {
+		if got := isLoopback(rows[i].Local); got != wantLoop {
+			t.Errorf("isLoopback(%v) = %v, want %v", rows[i].Local, got, wantLoop)
+		}
+	}
 }
 
 func TestParseProcNetTCP_SkipsMalformedLines(t *testing.T) {
@@ -63,13 +72,65 @@ func TestParseProcNetTCP_SkipsMalformedLines(t *testing.T) {
 		"   0: 00000000:0016 00000000:0000 0A 00000000:00000000\n" +
 		"   1: 0100007F:15\n" + // truncated
 		"   2: ZZZZZZZZ:0016 00000000:0000 0A\n" + // bad hex address
-		"   3: 0100007F:1538 00000000:0000 0A 00000000:00000000\n"
+		"   3: 0100007F:1538 00000000:0000 0A 00000000:00000000\n" +
+		"   4: 0100007:1538 00000000:0000 0A 00000000:00000000\n" // 7-char v4 address: length guard
 	rows, err := parseProcNetTCP(strings.NewReader(in), false)
 	if err != nil {
 		t.Fatalf("malformed lines must not error: %v", err)
 	}
 	if len(rows) != 2 || rows[0].LocalPort != 22 || rows[1].LocalPort != 5432 {
 		t.Fatalf("rows = %+v, want ports 22 and 5432", rows)
+	}
+}
+
+func TestParseProcNetTCP_ShortV6AddressSkipped(t *testing.T) {
+	in := "   0: 000000000000000000000001:1538 00000000:0000 0A 00000000:00000000\n" + // 24 chars
+		"   1: 00000000000000000000000001000000:1538 00000000:0000 0A 00000000:00000000\n"
+	rows, err := parseProcNetTCP(strings.NewReader(in), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Local != netip.MustParseAddr("::1") {
+		t.Fatalf("rows = %+v, want only ::1", rows)
+	}
+	// A v4-length address in the v6 table is equally malformed.
+	if _, err := parseProcNetTCP(strings.NewReader("   0: 0100007F:1538 x:0 0A\n"), true); err == nil {
+		t.Error("v4-length address in a v6 table must not parse")
+	}
+}
+
+func TestParseProcNetTCP_AllMalformedIsAnError(t *testing.T) {
+	in := "  sl  local_address rem_address   st\n" +
+		"   0: garbage:xx 00000000:0000 0A 0\n" +
+		"\n" +
+		"   1: 0100007F:15\n"
+	rows, err := parseProcNetTCP(strings.NewReader(in), false)
+	if err == nil || !strings.Contains(err.Error(), "no parseable rows in 2 data lines") {
+		t.Fatalf("err = %v, want no-parseable-rows error", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("rows = %+v, want none", rows)
+	}
+}
+
+func TestParseProcNetTCP_EmptyAndHeaderOnlyAreNotErrors(t *testing.T) {
+	for name, in := range map[string]string{
+		"empty":       "",
+		"blank lines": "\n  \n",
+		"header only": "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+	} {
+		rows, err := parseProcNetTCP(strings.NewReader(in), false)
+		if err != nil || len(rows) != 0 {
+			t.Errorf("%s: rows=%+v err=%v, want none, nil", name, rows, err)
+		}
+	}
+}
+
+func TestParseProcNetTCP_SomeGoodSomeBadIsNotAnError(t *testing.T) {
+	in := "   0: junk\n   1: 0100007F:1538 00000000:0000 0A 00000000:00000000\n"
+	rows, err := parseProcNetTCP(strings.NewReader(in), false)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows=%+v err=%v, want 1 row, nil", rows, err)
 	}
 }
 
