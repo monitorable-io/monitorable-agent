@@ -11,10 +11,11 @@ Version-controlled source for the Monitorable agent distribution served at the
 
 ## Contents
 
-- `install.sh` — Linux installer template with three placeholders: `@@BASE_URL@@` (the
+- `install.sh` — Linux installer template with four placeholders: `@@BASE_URL@@` (the
   env's download host), `@@SIGNING_PUBKEY@@` (the env's release-signing public key, one
-  line of base64 DER) and `@@MIN_VERSION@@` (the oldest release it accepts as `latest`).
-  `scripts/publish-dist.sh` fills all three when it renders the installer for the
+  line of base64 DER), `@@MIN_VERSION@@` (the oldest release it accepts as `latest`) and
+  `@@API_URL@@` (the env's public API host, which answers the enrollment call below).
+  `scripts/publish-dist.sh` fills all four when it renders the installer for the
   installer host (Bunny). Since v1.3.2 R2's `install.sh` is the stub (`install-stub.sh`,
   its own single `@@INSTALLER_URL@@` placeholder) instead of a second copy of this
   template. A copy with any placeholder left refuses to run. The API key comes from
@@ -35,6 +36,81 @@ Version-controlled source for the Monitorable agent distribution served at the
   `/etc/monitorable/agent.env`, 0600 root-only, referenced via `EnvironmentFile=`). The
   exporter uses `endpoint: "${MONITORABLE_ENDPOINT}"` (no `/otel` suffix; OTLP appends
   `/v1/metrics`).
+
+## Enrollment (host-driven install)
+
+Instead of copying a per-server command from the dashboard, a host can register itself.
+Create an enrollment key in **Team → API keys**, then run the installer with it:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL <installer>/install.sh | sudo sh -s -- --enroll-key=<key>
+```
+
+The installer calls `POST $API_URL/v1/enroll`, which creates the server (or rotates its
+agent key, see below) and returns the agent key and the ingest endpoint. The installer
+writes those to `/etc/monitorable/agent.env` exactly as a dashboard-rendered install does.
+An enrollment key can only register servers; if one is exposed, revoke it in
+**Team → API keys**.
+
+| Flag | Meaning |
+|---|---|
+| `--enroll-key=<key>` | The enrollment key. Replaces `--api-key=` and `--endpoint=`, which are refused alongside it; an exported `MONITORABLE_API_KEY` is refused too. |
+| `--name=<name>` | The server's name. Default: the host's name (`uname -n`), cut to 100 characters. Letters, digits, space, dot, underscore and dash; at most 100 characters. |
+| `--server-ref=<ref>` | This host's stable id: a cloud instance id, a Terraform `self.id`. Letters, digits, dot, underscore, colon, slash and dash; at most 128 characters. An empty value is refused. |
+
+The flags take the equals form only (`--name=web-01`, not `--name web-01`). `--name` and
+`--server-ref` need an enrollment key, and none of the three combines with `--uninstall`.
+
+**The key through the environment.** `MONITORABLE_ENROLL_KEY=<key>` is the alternative to
+`--enroll-key=`, for the same reason as `MONITORABLE_API_KEY`: an argv value sits in the
+world-readable `/proc/<pid>/cmdline` for the whole run and sudo writes it to `auth.log`.
+Export it inside a root shell (`sudo -s`), as in the main install. The installer removes
+it from its own environment right away, so no child process inherits it.
+
+**Flow order.** Platform checks, then download and signature/checksum verification, then
+enrollment, then install. Enrollment happens only once everything is verified, so a failed
+download or a bad signature never registers a server. A refused enrollment (plan limit, a
+rejected key, an API that cannot be reached) installs nothing: no service user, no files in
+place, and an agent already on the host keeps running, untouched.
+
+**No derived ref.** The installer never makes up a `--server-ref`, not from the hostname
+and not from a machine id. Without `--server-ref`, every run creates a new server. On a
+host that already has an agent, the installer warns before it enrolls, because re-running
+the command registers a second server and the first one goes stale on the dashboard. To
+re-enroll a host as the same server, pass the same `--server-ref` each time.
+
+**What a rotation means.** When `--server-ref` names a server the organization already has,
+the enrollment is a rotation: the same server keeps its name and its history, gets a new
+agent key, and the previous agent key stops working. The installer says so
+("Re-enrolled server #N (name): its agent key was rotated").
+
+**In automation, pass `--server-ref`.** The enrollment request is sent with
+`--retry 5 --retry-max-time 240`, so curl retries a 429 (waiting as long as `Retry-After`
+says), a 408, a server error (500, 502, 503, 504) and a timeout; any other 4xx, a plan
+limit included, is final on the first try. The API allows 10 enrollments a minute per key
+(a fixed one-minute window), and hosts that are waiting all come back at the same window
+reset, so one key enrolls roughly 40-50 hosts in a simultaneous burst. A host that runs out
+of retries exits 1 with "re-run in a minute" and nothing installed (cloud-init does not run
+the command again): stagger larger simultaneous boots, or give groups of hosts their own
+enrollment key. With `--server-ref`, a retried request is a second rotation of the same server, which
+changes nothing visible. Without it, a response that is lost after the server has already
+committed can register a second server, which then shows on the dashboard. So config
+management, Terraform and cloud-init should always pass it:
+
+```yaml
+## template: jinja
+#cloud-config
+# cloud-init fills in the instance id below
+runcmd:
+  - "curl --proto '=https' --tlsv1.2 -fsSL <installer>/install.sh | sh -s -- --enroll-key=<key> --server-ref={{ v1.instance_id }}"
+```
+
+**Where the enroll key goes.** The installer sends it to curl on curl's standard input
+(`-K -`), so it is never in curl's argv; it is never written to disk. The response, which
+holds the new agent key, is written under `umask 077`, read, and deleted at once.
+
+**A rollback after an enrollment keeps the enrolled key.** See "Failed-update rollback"
+below.
 
 Binaries and `SHA256SUMS` are **not** committed — `scripts/publish-dist.sh`
 cross-compiles the binaries fresh and writes the checksums alongside them.
@@ -128,6 +204,11 @@ scripts/publish-dist.sh staging --render-only    # build + render into ./distrib
 scripts/publish-dist.sh staging --check-installer  # manual pre-cutover check: does this env's installer host serve an installer with this env's key?
 ```
 
+`publish-dist.sh` renders `@@API_URL@@` per environment: staging `https://api-mon.ok9k.com`,
+prod `https://api.monitorable.io`. Dev has no publish step; for a hand-rendered dev
+installer set it to `http://api.monitorable.lan` (an `http://` API URL gets plain curl,
+without the `--proto`/`--tlsv1.2` flags).
+
 A build needs `VERSION=vX.Y.Z` (the release job passes the pushed tag; anything else is
 refused before signing) and `RELEASE_SIGNING_KEY`, which must match
 `distribution/keys/<env>.pub`. A publish or `--preflight` also needs
@@ -210,6 +291,12 @@ the install renames it clears any old snapshot, then, for a healthy agent only, 
   - The output says whether the previous agent is running again.
   - If this run gave a new API key or endpoint, the output says it was not applied: the
     restored agent keeps its previous `agent.env`.
+  - An enrollment run is the exception. The binary, config and unit are restored, but
+    `agent.env` stays as this run wrote it, because the enrolled agent key is shown once
+    and, after a `--server-ref` rotation, the previous key no longer works. The output
+    says "The restored agent uses the agent key from this enrollment." The restored
+    release reads that same `agent.env`, since a snapshot is only taken of a current
+    (v1.2.0 or later) unit.
 - **No snapshot** (fresh install, an agent already down or up for less than 10 s, the pre-v1.2.0
   migration): a failure is reported as before, as "restarting in a loop", or, when systemd
   refused the start outright, "systemd could not start the agent".
