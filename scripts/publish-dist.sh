@@ -40,10 +40,10 @@ VERSION="${VERSION:-dev}"
 # since v1.3.2 both installer hosts serve install.sh; R2 carries the stub, put only after
 # this run verified the installer host
 case "$ENV" in
-  staging) BASE_URL="https://get-mon.ok9k.com"; BUCKET="monitorable-get-staging"; R2_JURISDICTION="${R2_JURISDICTION-}"
+  staging) BASE_URL="https://get-mon.ok9k.com"; API_URL="https://api-mon.ok9k.com"; BUCKET="monitorable-get-staging"; R2_JURISDICTION="${R2_JURISDICTION-}"
            INSTALLER_URL="${INSTALLER_URL:-https://install-mon.ok9k.com}"; STUB_INSTALLER="${STUB_INSTALLER:-1}"
            BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-staging}" ;;
-  prod)    BASE_URL="https://get.monitorable.io"; BUCKET="monitorable-get-prod";   R2_JURISDICTION="${R2_JURISDICTION-eu}"
+  prod)    BASE_URL="https://get.monitorable.io"; API_URL="https://api.monitorable.io"; BUCKET="monitorable-get-prod";   R2_JURISDICTION="${R2_JURISDICTION-eu}"
            INSTALLER_URL="${INSTALLER_URL:-https://get.monitorable.net}"; STUB_INSTALLER="${STUB_INSTALLER:-1}"
            BUNNY_STORAGE_HOST="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"; BUNNY_STORAGE_ZONE="${BUNNY_STORAGE_ZONE:-mon-prod}" ;;
   *) echo "usage: $0 <staging|prod> [--render-only|--prune-only|--preflight|--check-installer]" >&2; exit 1 ;;
@@ -264,8 +264,9 @@ fi
 rm -rf "$OUT"
 mkdir -p "$OUT/configs" "$BINOUT"
 
-# 1. Render the installer. $OUT/installer/install.sh is the real installer with all three
-# values filled; it is what the installer host (Bunny) serves. $OUT/install.sh is the object
+# 1. Render the installer. $OUT/installer/install.sh is the real installer with all four
+# values filled (API_URL: the public API host that answers the installer's POST
+# /v1/enroll); it is what the installer host (Bunny) serves. $OUT/install.sh is the object
 # that becomes <bucket>/install.sh: the stub (STUB_INSTALLER=1) or the real installer
 # (STUB_INSTALLER=0). The stub is rendered here unconditionally — there is no pre-render
 # gate any more — but it is only PUBLISHED after this run has verified the installer host
@@ -273,7 +274,7 @@ mkdir -p "$OUT/configs" "$BINOUT"
 # installer unless the host demonstrably serves it first.
 mkdir -p "$OUT/installer"
 sed -e "s|@@BASE_URL@@|$BASE_URL|g" -e "s|@@SIGNING_PUBKEY@@|$PUBKEY_LINE|g" -e "s|@@MIN_VERSION@@|$VERSION|g" \
-  "$SRC/install.sh" > "$OUT/installer/install.sh"
+  -e "s|@@API_URL@@|$API_URL|g" "$SRC/install.sh" > "$OUT/installer/install.sh"
 if [ "$STUB_INSTALLER" = 1 ]; then
   sed "s|@@INSTALLER_URL@@|$INSTALLER_URL|g" "$SRC/install-stub.sh" > "$OUT/install.sh"
 else

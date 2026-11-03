@@ -16,6 +16,14 @@
 # Optional: --endpoint=https://ingest.monitorable.net (default), --version=vX.Y.Z
 # Update (key and endpoint from /etc/monitorable/agent.env): the same pipe, no options.
 # Uninstall: the same pipe with --uninstall.
+# Enrollment (Team → API keys → an enrollment key; no dashboard step per host): the same
+# pipe with --enroll-key=<key> instead of --api-key/--endpoint. The installer registers this
+# host through the API and takes the agent key and the endpoint from the answer.
+#   --name=<name>       the server's name (default: this host's name, cut to 100 characters)
+#   --server-ref=<ref>  this host's stable id (a cloud instance id, Terraform self.id). A
+#                       server this organization already has under that ref keeps its row
+#                       and gets a new agent key; without it, every run registers a NEW server.
+# MONITORABLE_ENROLL_KEY=<key> in the environment is the argv-free form, as above.
 
 set -e
 
@@ -49,11 +57,22 @@ AGENT_ENV="/etc/monitorable/agent.env"
 # /proc/<pid>/cmdline for the whole run and sudo writes it permanently to auth.log.
 # --api-key= still works and overrides, for the command the dashboard renders today.
 API_KEY="${MONITORABLE_API_KEY:-}"
+# Enrollment mode: set from the environment for the same reason as MONITORABLE_API_KEY, and
+# unexported at once so no child process (curl, systemctl) inherits it.
+ENROLL_KEY="${MONITORABLE_ENROLL_KEY:-}"
+unset MONITORABLE_ENROLL_KEY
+SERVER_NAME=""
+SERVER_REF=""
+NAME_GIVEN=0
+REF_GIVEN=0
+ENDPOINT_GIVEN=0
 INSTALL_DIR="/opt/monitorable"
 CONFIG_DIR="/etc/monitorable"
 BINARY_NAME="monitorable-agent"
 SERVICE_NAME="monitorable-agent"
 BASE_URL="@@BASE_URL@@"
+# The public API host that answers POST /v1/enroll (filled by publish-dist.sh per env).
+API_URL="@@API_URL@@"
 # Filled by publish-dist.sh (distribution/README.md "Integrity") when it renders this
 # script for the installer host, and the same way for the transitional copy on R2.
 # SIGNING_PUBKEY is one line: the base64 DER SubjectPublicKeyInfo of the release-signing
@@ -76,6 +95,7 @@ while [ $# -gt 0 ]; do
     case $1 in
         --endpoint=*)
             ENDPOINT="${1#*=}"
+            ENDPOINT_GIVEN=1
             OTHER_OPTS=1
             shift
             ;;
@@ -86,6 +106,23 @@ while [ $# -gt 0 ]; do
             ;;
         --version=*)
             VERSION="${1#*=}"
+            OTHER_OPTS=1
+            shift
+            ;;
+        --enroll-key=*)
+            ENROLL_KEY="${1#*=}"
+            OTHER_OPTS=1
+            shift
+            ;;
+        --name=*)
+            SERVER_NAME="${1#*=}"
+            NAME_GIVEN=1
+            OTHER_OPTS=1
+            shift
+            ;;
+        --server-ref=*)
+            SERVER_REF="${1#*=}"
+            REF_GIVEN=1
             OTHER_OPTS=1
             shift
             ;;
@@ -131,11 +168,11 @@ version_ge() {
     [ "$_a3" -ge "$_b3" ]
 }
 
-# A served installer has all three values filled. A leftover placeholder means the server
+# A served installer has all four values filled. A leftover placeholder means the server
 # that sent this script did not render it — refuse before touching anything. The marker
-# is spelled "@""@" so this file carries no literal one outside the three placeholders.
+# is spelled "@""@" so this file carries no literal one outside the four placeholders.
 _ph="@""@"
-case "$BASE_URL$SIGNING_PUBKEY$MIN_VERSION" in
+case "$BASE_URL$SIGNING_PUBKEY$MIN_VERSION$API_URL" in
     *"$_ph"*)
         printf '%b' "${RED}This installer was served unrendered. Use the install command from your dashboard.${NC}\n"
         exit 1
@@ -167,6 +204,48 @@ if [ "$VERSION" != latest ] && ! version_ge "$VERSION" v0.0.0; then
     printf '%b' "${RED}--version must be latest or vX.Y.Z, got:${NC} "
     printf '%s\n' "$VERSION"
     exit 1
+fi
+
+# Enrollment flags, all checked before any side effect. The name and the ref go into the
+# enroll request's JSON body as they are: the character classes leave out '"', '\' and
+# every control character, so printf builds a valid body without any escaping.
+if [ "$UNINSTALL" -eq 0 ]; then
+    if [ -z "$ENROLL_KEY" ]; then
+        if [ "$NAME_GIVEN" -eq 1 ] || [ "$REF_GIVEN" -eq 1 ]; then
+            printf '%b' "${RED}--name and --server-ref need --enroll-key (or MONITORABLE_ENROLL_KEY)${NC}\n"
+            exit 1
+        fi
+    else
+        if [ -n "$API_KEY" ] || [ "$ENDPOINT_GIVEN" -eq 1 ]; then
+            printf '%b' "${RED}--enroll-key takes the agent key and the endpoint from the enrollment; drop --api-key and --endpoint${NC}\n"
+            exit 1
+        fi
+        case "$ENROLL_KEY" in
+            *[!A-Za-z0-9._-]*)
+                printf '%b' "${RED}Error: the enrollment key contains characters outside [A-Za-z0-9._-]${NC}\n"
+                exit 1
+                ;;
+        esac
+        [ "$NAME_GIVEN" -eq 1 ] || SERVER_NAME="$(uname -n | cut -c1-100)"
+        _name_ok=1
+        case "$SERVER_NAME" in ''|*[!A-Za-z0-9._\ -]*) _name_ok=0 ;; esac
+        [ "${#SERVER_NAME}" -le 100 ] || _name_ok=0
+        if [ "$_name_ok" -eq 0 ]; then
+            printf '%b' "${RED}Error: --name may only contain letters, digits, space, dot, underscore and dash (max 100)${NC}\n"
+            exit 1
+        fi
+        # An explicitly empty ref (a template that rendered to nothing) is refused too: sent
+        # as "no ref", it would register a new server on every run.
+        _ref_ok=1
+        if [ "$REF_GIVEN" -eq 1 ]; then
+            case "$SERVER_REF" in ''|*[!A-Za-z0-9._:/-]*) _ref_ok=0 ;; esac
+            [ "${#SERVER_REF}" -le 128 ] || _ref_ok=0
+        fi
+        if [ "$_ref_ok" -eq 0 ]; then
+            printf '%b' "${RED}Error: --server-ref may only contain letters, digits, dot, underscore, colon, slash and dash (max 128)${NC}\n"
+            exit 1
+        fi
+    fi
 fi
 
 # Check if running as root
@@ -276,7 +355,11 @@ file_value() {
 }
 SOURCE_FILE=""
 SOURCE_PREFIX=""
-if [ -f "$AGENT_ENV" ]; then
+# Enrollment takes both values from the enroll response (enroll_host, after verification),
+# so nothing is read from an existing install and "no agent installed" does not apply.
+if [ -n "$ENROLL_KEY" ]; then
+    :
+elif [ -f "$AGENT_ENV" ]; then
     SOURCE_FILE="$AGENT_ENV"
 elif [ -f "$LEGACY_UNIT" ]; then
     SOURCE_FILE="$LEGACY_UNIT"
@@ -292,9 +375,9 @@ if [ -n "$SOURCE_FILE" ]; then
         ENDPOINT="$(file_value "$SOURCE_FILE" "${SOURCE_PREFIX}MONITORABLE_ENDPOINT=")"
     fi
 fi
-[ -n "$ENDPOINT" ] || ENDPOINT="$DEFAULT_ENDPOINT"
+[ -n "$ENROLL_KEY" ] || [ -n "$ENDPOINT" ] || ENDPOINT="$DEFAULT_ENDPOINT"
 
-if [ -z "$API_KEY" ]; then
+if [ -z "$ENROLL_KEY" ] && [ -z "$API_KEY" ]; then
     printf '%b' "${RED}No agent is installed on this server. Add the server in the dashboard to get its install command.${NC}\n"
     exit 1
 fi
@@ -306,38 +389,49 @@ if [ "$KEY_FROM_FILE" -eq 1 ]; then
     fi
 fi
 
-# The key and the endpoint are written verbatim into agent.env, and systemd hands every
-# assignment in that file to the agent — a literal newline in either would append an
-# arbitrary variable (SSL_CERT_FILE swaps Go's TLS root pool; MONITORABLE_STATE_DIR moves
-# the queue). Keys are 64-char hex today, so the charset can be strict.
-case "$API_KEY" in
-    *[!A-Za-z0-9._-]*)
-        printf '%b' "${RED}Error: the API key contains characters outside [A-Za-z0-9._-]${NC}\n"
-        exit 1
-        ;;
-esac
-# A URL legitimately needs more characters than a key, so reject only whitespace
-# (space, tab, newline, carriage return) here.
-case "$ENDPOINT" in
-    *[[:space:]]*)
-        printf '%b' "${RED}Error: the endpoint contains whitespace${NC}\n"
-        exit 1
-        ;;
-esac
+# check_agent_values: the agent key and the endpoint, from the flags/agent.env or from the
+# enrollment, before either is written anywhere.
+check_agent_values() {
+    # The key and the endpoint are written verbatim into agent.env, and systemd hands every
+    # assignment in that file to the agent — a literal newline in either would append an
+    # arbitrary variable (SSL_CERT_FILE swaps Go's TLS root pool; MONITORABLE_STATE_DIR moves
+    # the queue). Keys are 64-char hex today, so the charset can be strict.
+    case "$API_KEY" in
+        *[!A-Za-z0-9._-]*)
+            printf '%b' "${RED}Error: the API key contains characters outside [A-Za-z0-9._-]${NC}\n"
+            exit 1
+            ;;
+    esac
+    # A URL legitimately needs more characters than a key, so reject only whitespace
+    # (space, tab, newline, carriage return) here.
+    case "$ENDPOINT" in
+        *[[:space:]]*)
+            printf '%b' "${RED}Error: the endpoint contains whitespace${NC}\n"
+            exit 1
+            ;;
+    esac
 
-# Warn, do not reject: development installs legitimately point at http://ingest.monitorable.lan.
-case "$ENDPOINT" in
-    https://*) ;;
-    *)
-        printf '%b' "${RED}⚠️  WARNING: the endpoint is not https://${NC}\n"
-        printf '%b' "${RED}   The API key and every metric will travel in cleartext — anyone on the${NC}\n"
-        printf '%b' "${RED}   network path can read the key and modify what the agent reports.${NC}\n"
-        printf '%b' "${RED}   Use an https:// endpoint unless this is a local development install.${NC}\n"
-        ;;
-esac
+    # Warn, do not reject: development installs legitimately point at http://ingest.monitorable.lan.
+    case "$ENDPOINT" in
+        https://*) ;;
+        *)
+            printf '%b' "${RED}⚠️  WARNING: the endpoint is not https://${NC}\n"
+            printf '%b' "${RED}   The API key and every metric will travel in cleartext — anyone on the${NC}\n"
+            printf '%b' "${RED}   network path can read the key and modify what the agent reports.${NC}\n"
+            printf '%b' "${RED}   Use an https:// endpoint unless this is a local development install.${NC}\n"
+            ;;
+    esac
+}
+if [ -z "$ENROLL_KEY" ]; then
+    check_agent_values
+fi
 
 printf '%b' "${BLUE}Endpoint:${NC} "
-printf '%s\n' "$ENDPOINT"
+if [ -n "$ENROLL_KEY" ]; then
+    printf '%s\n' "from the enrollment"
+else
+    printf '%s\n' "$ENDPOINT"
+fi
 printf '%b' "${BLUE}Version:${NC} "
 printf '%s\n' "$VERSION"
 printf '\n'
@@ -506,9 +600,13 @@ TMP_UNIT_SUBST="$INSTALL_DIR/$UNIT_FILE.subst.tmp"
 # the unit is staged under a dot-name because systemd only reads *.service.
 TMP_CONFIG="$CONFIG_DIR/$CONFIG_FILE.tmp"
 TMP_UNIT_RENDERED="/etc/systemd/system/.$UNIT_FILE.tmp"
+# The enroll response (it carries the new agent key) and curl's error text for that call.
+TMP_ENROLL="$INSTALL_DIR/enroll.tmp"
+TMP_ENROLL_ERR="$INSTALL_DIR/enroll.err.tmp"
 
 cleanup_tmp() {
-    rm -f "$TMP_BIN" "$TMP_SUMS" "$TMP_SIG" "$TMP_PUB" "$TMP_CONFIG" "$TMP_UNIT" "$TMP_UNIT_SUBST" "$TMP_UNIT_RENDERED"
+    rm -f "$TMP_BIN" "$TMP_SUMS" "$TMP_SIG" "$TMP_PUB" "$TMP_CONFIG" "$TMP_UNIT" "$TMP_UNIT_SUBST" "$TMP_UNIT_RENDERED" \
+        "$TMP_ENROLL" "$TMP_ENROLL_ERR"
 }
 # Runs cleanup_tmp on any exit (error or otherwise) between now and the last install
 # `mv` below, so an abort anywhere in the download/verify/install sequence (a failed
@@ -607,6 +705,108 @@ printf '%b' "${GREEN}✅ Binary, config and unit template verified against SHA25
 # Named so the output records which bytes this host got; each release's SHA256SUMS is also
 # attached to its GitHub release, an origin independent of this download host.
 printf '   %s %s sha256 %s\n' "$BINARY_FILE" "$SIGNED_VERSION" "$BIN_SHA256"
+
+# --- Enrollment (--enroll-key) ----------------------------------------------------------
+# Only now, with everything downloaded and verified: a failed download or a bad signature
+# never registers a server, and the agent key arrives right before it is installed. Before
+# the service user and the rollback snapshot, so a failed enrollment (plan limit, bad key,
+# API unreachable) installs nothing and leaves an existing agent untouched.
+
+# json_field <file> <key>: the first top-level scalar named <key>; strings unquoted. The
+# enroll answers are flat objects; protojson puts arbitrary whitespace (spaces, tabs, line
+# breaks) around ':' and ',', so newlines and tabs go first and a number's trailing spaces
+# ("42 ,") are cut after.
+json_field() {
+    tr -d '\n\r\t' < "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" |
+        head -n 1 | sed 's/[[:space:]]*$//'
+}
+
+# enroll_host: POST /v1/enroll with the enrollment key; sets API_KEY, ENDPOINT, SERVER_ID,
+# SERVER_NAME and ROTATED from the answer, or exits 1 having installed nothing.
+enroll_host() {
+    if [ -n "$SERVER_REF" ]; then
+        _body="$(printf '{"name":"%s","server_ref":"%s"}' "$SERVER_NAME" "$SERVER_REF")"
+    else
+        _body="$(printf '{"name":"%s"}' "$SERVER_NAME")"
+        if [ -f "$AGENT_ENV" ] || [ -f "$LEGACY_UNIT" ]; then
+            printf '%b' "${YELLOW}⚠️  An agent is already installed here. Enrolling without --server-ref registers a NEW server; the old one goes stale on the dashboard.${NC}\n"
+        fi
+    fi
+    printf '%b' "${YELLOW}🪪 Enrolling this host...${NC}\n"
+    # --retry covers 429 and 5xx and waits as long as Retry-After says; a 4xx answer other
+    # than 429 (402 plan limit, 401, 403) is final on the first try.
+    set -- -sS --max-time 30 --retry 5 --retry-max-time 240 -K - \
+        -H 'Content-Type: application/json' -H 'Accept: application/json' \
+        -d "$_body" -o "$TMP_ENROLL" -w '%{http_code}'
+    case "$API_URL" in
+        https://*) set -- --proto '=https' --tlsv1.2 "$@" ;;
+    esac
+    # The key reaches curl as a config line on its stdin (-K -), never in its argv: curl's
+    # /proc/<pid>/cmdline is world-readable for the whole call, retries included. The key's
+    # character class has no '"' or '\', so it needs no quoting there. The response holds the
+    # new agent key, so it is written under umask 077, then parsed and deleted at once.
+    rm -f "$TMP_ENROLL" "$TMP_ENROLL_ERR"
+    if ! _status="$(umask 077; printf 'header = "Authorization: Bearer %s"\n' "$ENROLL_KEY" |
+        curl "$@" "$API_URL/v1/enroll" 2>"$TMP_ENROLL_ERR")"; then
+        printf '%b' "${RED}❌ Could not reach ${NC}"
+        printf '%s' "$API_URL"
+        printf '%b' "${RED} to enroll this host${NC}\n"
+        cat "$TMP_ENROLL_ERR" >&2 || true
+        cleanup_tmp
+        exit 1
+    fi
+    # No body at all (curl writes no file then) reads as an empty one.
+    [ -f "$TMP_ENROLL" ] || : > "$TMP_ENROLL"
+    case "$_status" in
+        200|201)
+            API_KEY="$(json_field "$TMP_ENROLL" agent_api_key)"
+            ENDPOINT="$(json_field "$TMP_ENROLL" ingest_endpoint)"
+            SERVER_ID="$(json_field "$TMP_ENROLL" server_id)"
+            SERVER_NAME="$(json_field "$TMP_ENROLL" name)"
+            ROTATED="$(json_field "$TMP_ENROLL" rotated)"
+            rm -f "$TMP_ENROLL" "$TMP_ENROLL_ERR"
+            if [ -z "$API_KEY" ] || [ -z "$ENDPOINT" ]; then
+                cleanup_tmp
+                printf '%b' "${RED}❌ The enrollment response was incomplete; nothing was installed${NC}\n"
+                exit 1
+            fi
+            if [ "$ROTATED" = true ]; then
+                printf '%b🔁 Re-enrolled server #%s (%s): its agent key was rotated%b\n' "$GREEN" "$SERVER_ID" "$SERVER_NAME" "$NC"
+            else
+                printf '%b✅ Enrolled as server #%s (%s)%b\n' "$GREEN" "$SERVER_ID" "$SERVER_NAME" "$NC"
+            fi
+            return 0
+            ;;
+    esac
+    _code="$(json_field "$TMP_ENROLL" code)"
+    _detail="$(json_field "$TMP_ENROLL" detail)"
+    [ -n "$_code" ] || _code=unknown
+    [ -n "$_detail" ] || _detail=unknown
+    cleanup_tmp
+    case "$_status" in
+        402)
+            printf '%b❌ Plan limit reached: %s%b\n' "$RED" "$_detail" "$NC"
+            printf '%b' "   Remove a server or upgrade the plan, then re-run.\n"
+            ;;
+        401)
+            printf '%b❌ The enrollment key was rejected (%s). Create a new enrollment key in Team → API keys.%b\n' "$RED" "$_code" "$NC"
+            ;;
+        403)
+            printf '%b❌ This key cannot enroll servers (%s): it needs the servers:enroll scope and the admin role.%b\n' "$RED" "$_code" "$NC"
+            ;;
+        429)
+            printf '%b' "${RED}❌ Too many enrollments for this key right now; re-run in a minute.${NC}\n"
+            ;;
+        *)
+            printf '%b❌ Enrollment failed (HTTP %s, %s): %s%b\n' "$RED" "$_status" "$_code" "$_detail" "$NC"
+            ;;
+    esac
+    exit 1
+}
+if [ -n "$ENROLL_KEY" ]; then
+    enroll_host
+    check_agent_values
+fi
 
 # Create user and group — only now that everything downloaded has verified.
 printf '%b' "${YELLOW}👤 Creating user and group...${NC}\n"
@@ -899,6 +1099,10 @@ printf '%b' "Service status:\n"
 systemctl status "$SERVICE_NAME" --no-pager -l || true
 
 printf '\n'
+if [ -n "$ENROLL_KEY" ]; then
+    printf '%b📇 On the dashboard as server #%s (%s)%b\n' "$BLUE" "$SERVER_ID" "$SERVER_NAME" "$NC"
+    printf '\n'
+fi
 printf '%b' "${BLUE}📡 The agent is now sending metrics to:${NC}\n"
 printf '   %s\n' "$ENDPOINT/v1/metrics"
 printf '\n'

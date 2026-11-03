@@ -15,6 +15,8 @@ CT="${1:?usage: $0 <lxd-container | ssh:user@host>}"
 SRC_URL="${SRC_URL:-https://get-mon.ok9k.com}"
 ORIGIN="https://localhost:8443"
 KEY="$(printf '%064d' 0 | tr 0 a)"
+# A fake enrollment key in the real key shape; only the test mirror ever sees it.
+ENROLL_KEY="mon_test_$(printf '%043d' 0 | tr 0 b)"
 ENDPOINT="https://ingest-mon.ok9k.com"
 MIN="v1.3.0"
 FAILS=0
@@ -75,14 +77,19 @@ TEST_PUB="$(raw "openssl pkey -in /root/tls/sign.key -pubout" | grep -v -- '----
 raw "cat > /root/install-test-mirror.py" < scripts/install-test-mirror.py
 raw "cat > /root/mirror-build.sh" < scripts/install-test-mirror-build.sh
 trap 'raw "systemctl stop install-test-mirror >/dev/null 2>&1" || true; if [ -n "$SSH_CTL" ]; then ssh -o ControlPath="$SSH_CTL/c" -O exit "$SSH_DEST" 2>/dev/null; rm -rf "$SSH_CTL"; fi' EXIT
-run "systemctl stop install-test-mirror >/dev/null 2>&1; systemd-run --quiet --collect --unit=install-test-mirror python3 /root/install-test-mirror.py"
+run "systemctl stop install-test-mirror >/dev/null 2>&1; rm -f /root/mirror-posts.log; systemd-run --quiet --collect --unit=install-test-mirror python3 /root/install-test-mirror.py $ENROLL_KEY $KEY $ENDPOINT"
 
-# render <base url> <path in container> [<min version> [<signing key>]]: fill the
-# placeholders the way publish-dist.sh does.
+# render <base url> <path in container> [<min version> [<signing key> [<api url>]]]: fill
+# the placeholders the way publish-dist.sh does. The API URL is a mirror tree that answers
+# POST /v1/enroll (install-test-mirror.py); api-good by default.
 render() {
     sed -e "s|@@BASE_URL@@|$1|g" -e "s|@@SIGNING_PUBKEY@@|${4:-$TEST_PUB}|g" -e "s|@@MIN_VERSION@@|${3:-$MIN}|g" \
-        distribution/install.sh | raw "cat > $2"
+        -e "s|@@API_URL@@|${5:-$ORIGIN/api-good}|g" distribution/install.sh | raw "cat > $2"
 }
+# posts <tree>: how many enroll calls the mirror has answered for that tree so far.
+posts() { run "cat /root/mirror-posts.log 2>/dev/null | grep -c '^POST /$1/v1/enroll ' || true"; }
+# lastbody <tree>: the JSON body of the latest enroll call for that tree.
+lastbody() { run "grep '^POST /$1/v1/enroll ' /root/mirror-posts.log | tail -n 1 | cut -d' ' -f3-"; }
 
 run "sh /root/mirror-build.sh good $MIN ok ok"
 run "sh /root/mirror-build.sh tampered $MIN tampered ok"
@@ -473,6 +480,84 @@ check uninstall-rm-failure '[ "$rc" = 1 ] && out_has "Uninstall incomplete" && o
 run "mount -o remount,rw /etc/monitorable && rm -f /etc/monitorable/keepme && umount /etc/monitorable"
 rc=$(run_rc "sh /root/install.sh --uninstall")
 check uninstall-rm-failure-cleanup '[ "$rc" = 0 ] && ! run "test -e /etc/monitorable"'
+
+# --- Enrollment: --enroll-key / --name / --server-ref (Part 2d) ---------------------------
+# The host is clean again here. Every flag mistake is refused before any side effect: no
+# directory, no user, and no call to the enroll endpoint.
+render "$ORIGIN/good" /root/install-rotate.sh "" "" "$ORIGIN/api-rotate"
+render "$ORIGIN/good" /root/install-402.sh "" "" "$ORIGIN/api-402"
+render "$ORIGIN/good" /root/install-429.sh "" "" "$ORIGIN/api-429"
+# Nothing listens on 8444: the enroll call cannot connect.
+render "$ORIGIN/good" /root/install-noapi.sh "" "" "https://localhost:8444"
+no_trace() { ! run "test -e /opt/monitorable || test -e /etc/monitorable || getent passwd monitorable"; }
+LONG_NAME="$(printf '%0101d' 0)"
+LONG_REF="$(printf '%0129d' 0)"
+EF=0
+# refused <message> <installer arguments>: exit 1 with <message> and no trace on the host.
+refused() {
+    rc=$(run_rc "$2")
+    if [ "$rc" = 1 ] && out_has "$1" && no_trace; then :; else printf '  refused: %s\n' "$2"; EF=1; fi
+}
+refused "need --enroll-key (or MONITORABLE_ENROLL_KEY)" "sh /root/install.sh --name=x"
+refused "need --enroll-key (or MONITORABLE_ENROLL_KEY)" "sh /root/install.sh --server-ref=i-1"
+refused "drop --api-key and --endpoint" "sh /root/install.sh --enroll-key=$ENROLL_KEY --api-key=$KEY"
+refused "drop --api-key and --endpoint" "MONITORABLE_API_KEY=$KEY sh /root/install.sh --enroll-key=$ENROLL_KEY"
+refused "drop --api-key and --endpoint" "sh /root/install.sh --enroll-key=$ENROLL_KEY --endpoint=$ENDPOINT"
+refused "the enrollment key contains characters outside" "sh /root/install.sh --enroll-key=mon_test_b+b"
+refused "the enrollment key contains characters outside" "MONITORABLE_ENROLL_KEY=mon_test_b+b sh /root/install.sh"
+refused "--name may only contain" "sh /root/install.sh --enroll-key=$ENROLL_KEY '--name=we\"b'"
+refused "--name may only contain" "sh /root/install.sh --enroll-key=$ENROLL_KEY --name="
+refused "--name may only contain" "sh /root/install.sh --enroll-key=$ENROLL_KEY --name=$LONG_NAME"
+refused "--server-ref may only contain" "sh /root/install.sh --enroll-key=$ENROLL_KEY '--server-ref=i 1'"
+refused "--server-ref may only contain" "sh /root/install.sh --enroll-key=$ENROLL_KEY --server-ref=$LONG_REF"
+refused "--server-ref may only contain" "sh /root/install.sh --enroll-key=$ENROLL_KEY --server-ref="
+refused "--uninstall takes no other options" "sh /root/install.sh --uninstall --enroll-key=$ENROLL_KEY"
+check enroll-flags-refused-before-side-effects '[ "$EF" = 0 ] && [ "$(posts api-good)" = 0 ]'
+
+# A fresh enrollment: the agent key and endpoint come from the (spaced, multi-line) enroll
+# response and land in agent.env byte for byte; the body carries the given name only.
+rc=$(run_rc "sh /root/install.sh --enroll-key=$ENROLL_KEY --name=web-01")
+check enroll-creates '[ "$rc" = 0 ] && run "systemctl is-active --quiet monitorable-agent" && out_has "Endpoint: from the enrollment" && out_has "Enrolled as server #42 (web-01)" && [ "$(run "cat /etc/monitorable/agent.env")" = "$(printf "MONITORABLE_API_KEY=%s\nMONITORABLE_ENDPOINT=%s" "$KEY" "$ENDPOINT")" ] && [ "$(run "stat -c %a /etc/monitorable/agent.env")" = 600 ] && [ "$(lastbody api-good)" = "{\"name\":\"web-01\"}" ]'
+# The enrollment key is never written to disk or printed; the response file is gone.
+check enroll-key-never-on-disk '! run "grep -rqF $ENROLL_KEY /etc/monitorable /opt/monitorable /var/lib/monitorable /etc/systemd/system/monitorable-agent.service" && ! run "test -e /opt/monitorable/enroll.tmp || test -e /opt/monitorable/enroll.err.tmp" && ! out_has "$ENROLL_KEY"'
+
+# The one-host dashboard command (no --server-ref, default name) on a host that already runs
+# an agent registers a second server and says so; the running agent is snapshotted like any
+# update, and the snapshot is gone once the new one stays up.
+settle
+rc=$(run_rc "sh /root/install.sh --enroll-key=$ENROLL_KEY")
+check enroll-over-existing-adds-server '[ "$rc" = 0 ] && out_has "registers a NEW server" && out_has "Saved the running agent for rollback" && out_has "Enrolled as server #42" && no_prev && [ "$(lastbody api-good)" = "{\"name\":\"$(run "uname -n | cut -c1-100")\"}" ] && run "systemctl is-active --quiet monitorable-agent"'
+
+# --server-ref matching an existing server rotates its key; the environment form of the key.
+rc=$(run_rc "MONITORABLE_ENROLL_KEY=$ENROLL_KEY sh /root/install-rotate.sh --server-ref=i-1")
+check enroll-rotation-message '[ "$rc" = 0 ] && out_has "Re-enrolled server #42 (web-01): its agent key was rotated" && ! out_has "registers a NEW server" && [ "$(lastbody api-rotate)" = "{\"name\":\"$(run "uname -n | cut -c1-100")\",\"server_ref\":\"i-1\"}" ] && run "grep -qx MONITORABLE_API_KEY=$KEY /etc/monitorable/agent.env && systemctl is-active --quiet monitorable-agent"'
+
+# A refused enrollment over a running agent leaves it exactly as it was.
+BEFORE="$(state)"
+rc=$(run_rc "sh /root/install-402.sh --enroll-key=$ENROLL_KEY --server-ref=i-1")
+check enroll-failure-existing-untouched '[ "$rc" = 1 ] && out_has "Plan limit reached" && [ "$(state)" = "$BEFORE" ] && run "systemctl is-active --quiet monitorable-agent" && ! run "test -e /opt/monitorable/enroll.tmp"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A plan limit on a clean host installs nothing (no binary, no user, no agent.env) and is
+# not retried: a 402 never turns into a 201 by waiting.
+P402="$(posts api-402)"
+rc=$(run_rc "sh /root/install-402.sh --enroll-key=$ENROLL_KEY")
+check enroll-plan-limit-installs-nothing '[ "$rc" = 1 ] && out_has "Plan limit reached: max_servers is 3 on Lite" && out_has "Remove a server or upgrade the plan, then re-run." && ! run "test -e /opt/monitorable/monitorable-agent || test -e /etc/monitorable/agent.env || test -e /opt/monitorable/enroll.tmp || getent passwd monitorable" && [ "$(posts api-402)" = $((P402 + 1)) ]'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A key the API rejects, and an API that cannot be reached, install nothing either.
+rc=$(run_rc "sh /root/install.sh --enroll-key=mon_test_wrong")
+check enroll-rejected-key-installs-nothing '[ "$rc" = 1 ] && out_has "The enrollment key was rejected (invalid_api_key)" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+rc=$(run_rc "sh /root/install-noapi.sh --enroll-key=$ENROLL_KEY")
+check enroll-unreachable-installs-nothing '[ "$rc" = 1 ] && out_has "Could not reach https://localhost:8444 to enroll this host" && ! run "test -e /opt/monitorable/monitorable-agent || getent passwd monitorable"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
+
+# A 429 (an autoscaling burst over the per-key rate limit) is waited out per Retry-After and
+# retried; the install then completes.
+rc=$(run_rc "sh /root/install-429.sh --enroll-key=$ENROLL_KEY")
+check enroll-429-retried '[ "$rc" = 0 ] && out_has "Enrolled as server #42" && [ "$(posts api-429)" = 2 ] && run "systemctl is-active --quiet monitorable-agent"'
+run "sh /root/install.sh --uninstall >/dev/null 2>&1"
 
 # Under SELinux the whole run left no AVC or USER_AVC denial. "<no matches>" is required
 # explicitly: ausearch also exits 1 on a bad -ts or a missing log, which must not pass.
