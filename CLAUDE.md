@@ -79,7 +79,7 @@ The Linux-only installer (`distribution/install.sh`) downloads the binary, confi
 systemd unit to `.tmp` paths, verifies them against a published `SHA256SUMS`, and only
 then installs and starts the service. See `distribution/README.md` for the full publish
 pipeline (R2 buckets per env, checksum integrity, retry/offline buffering, rollback
-semantics).
+semantics). Enrollment mode (`--enroll-key=`) calls `$API_URL/v1/enroll` (`@@API_URL@@`, rendered per env) after verification and before installing.
 
 ## Testing
 

@@ -49,6 +49,13 @@ The installer:
   subdirectory (the on-disk retry queue) is created by the `file_storage` extension the
   first time the agent starts
 
+To register hosts without a dashboard step per server, create an enrollment key in
+Team → API keys and run `curl --proto '=https' --tlsv1.2 -fsSL <installer>/install.sh | sudo sh -s -- --enroll-key=<key>`.
+The installer registers the host through the API and takes the agent key and endpoint from
+the answer. In automation, also pass `--server-ref=<id>` (a cloud instance id, for example):
+without it every run creates a new server. See the
+[enrollment section of the distribution README](distribution/README.md#enrollment-host-driven-install).
+
 Re-running the command upgrades an existing install in place, including one made under
 the tool's previous name (`monitorable-otelcol` / `monitorable-collector`).
 
