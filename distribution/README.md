@@ -54,7 +54,7 @@ An enrollment key can only register servers; if one is exposed, revoke it in
 
 | Flag | Meaning |
 |---|---|
-| `--enroll-key=<key>` | The enrollment key. Replaces `--api-key=` and `--endpoint=`, which are refused alongside it. |
+| `--enroll-key=<key>` | The enrollment key. Replaces `--api-key=` and `--endpoint=`, which are refused alongside it; an exported `MONITORABLE_API_KEY` is refused too. |
 | `--name=<name>` | The server's name. Default: the host's name (`uname -n`), cut to 100 characters. Letters, digits, space, dot, underscore and dash; at most 100 characters. |
 | `--server-ref=<ref>` | This host's stable id: a cloud instance id, a Terraform `self.id`. Letters, digits, dot, underscore, colon, slash and dash; at most 128 characters. An empty value is refused. |
 
@@ -86,8 +86,13 @@ agent key, and the previous agent key stops working. The installer says so
 
 **In automation, pass `--server-ref`.** The enrollment request is sent with
 `--retry 5 --retry-max-time 240`, so curl retries a 429 (waiting as long as `Retry-After`
-says), a 5xx and a timeout; any other 4xx, a plan limit included, is final on the first
-try. With `--server-ref`, a retried request is a second rotation of the same server, which
+says), a 408, a server error (500, 502, 503, 504) and a timeout; any other 4xx, a plan
+limit included, is final on the first try. The API allows 10 enrollments a minute per key
+(a fixed one-minute window), and hosts that are waiting all come back at the same window
+reset, so one key enrolls roughly 40-50 hosts in a simultaneous burst. A host that runs out
+of retries exits 1 with "re-run in a minute" and nothing installed (cloud-init does not run
+the command again): stagger larger simultaneous boots, or give groups of hosts their own
+enrollment key. With `--server-ref`, a retried request is a second rotation of the same server, which
 changes nothing visible. Without it, a response that is lost after the server has already
 committed can register a second server, which then shows on the dashboard. So config
 management, Terraform and cloud-init should always pass it:
@@ -95,6 +100,7 @@ management, Terraform and cloud-init should always pass it:
 ```yaml
 ## template: jinja
 #cloud-config
+# cloud-init fills in the instance id below
 runcmd:
   - "curl --proto '=https' --tlsv1.2 -fsSL <installer>/install.sh | sh -s -- --enroll-key=<key> --server-ref={{ v1.instance_id }}"
 ```
