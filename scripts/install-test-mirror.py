@@ -10,11 +10,11 @@ built by install-test-mirror-build.sh from the genuine staging files.
   POST https://127.0.0.1:8443/<tree>/v1/enroll -> a stand-in for the API's enroll endpoint
        (the wire contract in the Part 2d plan), picked by <tree>:
          api-good   201, the agent key and endpoint in spaced, multi-line JSON
-         api-rotate 200, rotated: true
+         api-rotate 200, rotated: true, a different agent key (the rotated one)
          api-402    402 plan_limit_reached
          api-429    429 + Retry-After: 1 on the first call, 201 on every later one
 
-Usage: install-test-mirror.py <enroll key> <agent key> <ingest endpoint>. Every enroll call
+Usage: install-test-mirror.py <enroll key> <agent key> <ingest endpoint> <rotated agent key>. Every enroll call
 needs "Authorization: Bearer <enroll key>" (else 401 invalid_api_key). Each POST appends
 "POST <path> <body>" to /root/mirror-posts.log (never the Authorization header).
 
@@ -27,7 +27,7 @@ import ssl
 import sys
 import threading
 
-ENROLL_KEY, AGENT_KEY, ENDPOINT = sys.argv[1], sys.argv[2], sys.argv[3]
+ENROLL_KEY, AGENT_KEY, ENDPOINT, ROTATED_KEY = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 POST_LOG = "/root/mirror-posts.log"
 _lock = threading.Lock()
 _calls = {}
@@ -86,7 +86,7 @@ class RedirectOrServe(http.server.SimpleHTTPRequestHandler):
         elif tree == "api-rotate":
             self.answer(200, (
                 '{"server_id":42,\n\t"name" :\t"web-01",\n "agent_api_key" : "%s" ,'
-                ' "ingest_endpoint":"%s", "rotated" : true\n}' % (AGENT_KEY, ENDPOINT)
+                ' "ingest_endpoint":"%s", "rotated" : true\n}' % (ROTATED_KEY, ENDPOINT)
             ).encode())
         elif tree == "api-402":
             self.answer(402, problem(402, "plan_limit_reached", "max_servers is 3 on Lite"))

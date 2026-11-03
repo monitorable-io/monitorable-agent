@@ -17,6 +17,8 @@ ORIGIN="https://localhost:8443"
 KEY="$(printf '%064d' 0 | tr 0 a)"
 # A fake enrollment key in the real key shape; only the test mirror ever sees it.
 ENROLL_KEY="mon_test_$(printf '%043d' 0 | tr 0 b)"
+# The agent key the mirror's api-rotate tree hands out: a rotation must visibly change agent.env.
+ROTATED_KEY="$(printf '%064d' 0 | tr 0 c)"
 ENDPOINT="https://ingest-mon.ok9k.com"
 MIN="v1.3.0"
 FAILS=0
@@ -77,7 +79,7 @@ TEST_PUB="$(raw "openssl pkey -in /root/tls/sign.key -pubout" | grep -v -- '----
 raw "cat > /root/install-test-mirror.py" < scripts/install-test-mirror.py
 raw "cat > /root/mirror-build.sh" < scripts/install-test-mirror-build.sh
 trap 'raw "systemctl stop install-test-mirror >/dev/null 2>&1" || true; if [ -n "$SSH_CTL" ]; then ssh -o ControlPath="$SSH_CTL/c" -O exit "$SSH_DEST" 2>/dev/null; rm -rf "$SSH_CTL"; fi' EXIT
-run "systemctl stop install-test-mirror >/dev/null 2>&1; rm -f /root/mirror-posts.log; systemd-run --quiet --collect --unit=install-test-mirror python3 /root/install-test-mirror.py $ENROLL_KEY $KEY $ENDPOINT"
+run "systemctl stop install-test-mirror >/dev/null 2>&1; rm -f /root/mirror-posts.log; systemd-run --quiet --collect --unit=install-test-mirror python3 /root/install-test-mirror.py $ENROLL_KEY $KEY $ENDPOINT $ROTATED_KEY"
 
 # render <base url> <path in container> [<min version> [<signing key> [<api url>]]]: fill
 # the placeholders the way publish-dist.sh does. The API URL is a mirror tree that answers
@@ -528,9 +530,23 @@ settle
 rc=$(run_rc "sh /root/install.sh --enroll-key=$ENROLL_KEY")
 check enroll-over-existing-adds-server '[ "$rc" = 0 ] && out_has "registers a NEW server" && out_has "Saved the running agent for rollback" && out_has "Enrolled as server #42" && no_prev && [ "$(lastbody api-good)" = "{\"name\":\"$(run "uname -n | cut -c1-100")\"}" ] && run "systemctl is-active --quiet monitorable-agent"'
 
+# A rotation whose release then fails to stay up: the snapshot's binary, config and unit
+# come back, but agent.env keeps the key from this enrollment (the snapshot's key is dead
+# server-side after a rotation). The running agent holds $KEY here; api-rotate hands out
+# $ROTATED_KEY.
+run "sh /root/mirror-build.sh broken v1.3.1 ok ok latest broken"
+render "$ORIGIN/broken" /root/install-broken-rotate.sh "" "" "$ORIGIN/api-rotate"
+settle
+check enroll-rollback-precondition 'run "grep -qx MONITORABLE_API_KEY=$KEY /etc/monitorable/agent.env && systemctl is-active --quiet monitorable-agent"'
+BIN_BEFORE="$(run "stat -c %i /opt/monitorable/monitorable-agent")"
+rc=$(run_rc "sh /root/install-broken-rotate.sh --enroll-key=$ENROLL_KEY --server-ref=i-1")
+check enroll-rollback-keeps-enrolled-key '[ "$rc" = 1 ] && out_has "Re-enrolled server #42" && out_has "Saved the running agent for rollback" && out_has "previous agent is restored and running" && out_has "The restored agent uses the agent key from this enrollment." && ! out_has "was not applied" && [ "$(run "cat /etc/monitorable/agent.env")" = "$(printf "MONITORABLE_API_KEY=%s\nMONITORABLE_ENDPOINT=%s" "$ROTATED_KEY" "$ENDPOINT")" ] && [ "$(run "stat -c %i /opt/monitorable/monitorable-agent")" = "$BIN_BEFORE" ] && ! run "grep -q monitorable_rollback_test /etc/monitorable/collector-config.yaml" && no_prev && run "systemctl is-active --quiet monitorable-agent"'
+
 # --server-ref matching an existing server rotates its key; the environment form of the key.
+# agent.env is reset to $KEY first, so the rotated key landing there is this run's doing.
+run "printf 'MONITORABLE_API_KEY=%s\nMONITORABLE_ENDPOINT=%s\n' $KEY $ENDPOINT > /etc/monitorable/agent.env && systemctl restart monitorable-agent"
 rc=$(run_rc "MONITORABLE_ENROLL_KEY=$ENROLL_KEY sh /root/install-rotate.sh --server-ref=i-1")
-check enroll-rotation-message '[ "$rc" = 0 ] && out_has "Re-enrolled server #42 (web-01): its agent key was rotated" && ! out_has "registers a NEW server" && [ "$(lastbody api-rotate)" = "{\"name\":\"$(run "uname -n | cut -c1-100")\",\"server_ref\":\"i-1\"}" ] && run "grep -qx MONITORABLE_API_KEY=$KEY /etc/monitorable/agent.env && systemctl is-active --quiet monitorable-agent"'
+check enroll-rotation-message '[ "$rc" = 0 ] && out_has "Re-enrolled server #42 (web-01): its agent key was rotated" && ! out_has "registers a NEW server" && [ "$(lastbody api-rotate)" = "{\"name\":\"$(run "uname -n | cut -c1-100")\",\"server_ref\":\"i-1\"}" ] && run "grep -qx MONITORABLE_API_KEY=$ROTATED_KEY /etc/monitorable/agent.env && systemctl is-active --quiet monitorable-agent"'
 
 # A refused enrollment over a running agent leaves it exactly as it was.
 BEFORE="$(state)"

@@ -1041,7 +1041,17 @@ rollback() {
     printf '%b%s%b\n' "${YELLOW}↩️  Update to " "$SIGNED_VERSION" " failed — restoring the previous agent...${NC}"
     rb_step "restore the binary" mv -f "$PREV_BIN" "$INSTALL_DIR/$BINARY_NAME"
     rb_step "restore the configuration" mv -f "$PREV_CONFIG" "$CONFIG_DIR/$CONFIG_FILE"
-    rb_step "restore agent.env" mv -f "$PREV_ENV" "$AGENT_ENV"
+    # An enrollment keeps this run's agent.env: the enroll answer's key was shown once, and
+    # after a --server-ref rotation the snapshot's key no longer works, so restoring it would
+    # leave a "running" agent the API refuses. Safe for the restored release: a snapshot is
+    # only taken of the current unit (no pre-v1.2.0 monitorable-collector unit, see
+    # PREV_HEALTHY), whose EnvironmentFile= reads this same two-line agent.env.
+    if [ -n "$ENROLL_KEY" ]; then
+        ENV_CHANGED=0
+        rb_step "remove the agent.env snapshot" rm -f "$PREV_ENV"
+    else
+        rb_step "restore agent.env" mv -f "$PREV_ENV" "$AGENT_ENV"
+    fi
     rb_step "restore the unit" mv -f "$PREV_UNIT" "/etc/systemd/system/$UNIT_FILE"
     # On an SELinux host the snapshot took /etc/monitorable's label (etc_t) and mv keeps it;
     # put back the policy default (systemd_unit_file_t). Hygiene, not a gate: under the
@@ -1066,6 +1076,10 @@ rollback() {
     exit 1
 }
 note_env_not_applied() {
+    if [ -n "$ENROLL_KEY" ]; then
+        printf '%b' "   The restored agent uses the agent key from this enrollment.\n"
+        return 0
+    fi
     [ "$ENV_CHANGED" -eq 1 ] || return 0
     printf '%b' "${YELLOW}   The API key or endpoint given to this run was not applied: the restored agent keeps${NC}\n"
     printf '%b' "${YELLOW}   its previous ones. Re-run this command once a fixed release is out.${NC}\n"
