@@ -13,9 +13,9 @@ import (
 // err (when set) fails every Batch/Set/Delete without touching disk, like a
 // bbolt transaction that does not commit.
 type fakeClient struct {
-	mu     sync.Mutex
-	disk   map[string][]byte
-	calls  []string
+	mu      sync.Mutex
+	disk    map[string][]byte
+	calls   []string
 	err     error
 	closed  int
 	commits int // successful Batches that changed disk

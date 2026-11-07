@@ -42,7 +42,7 @@ type client struct {
 	log     *zap.Logger
 	now     func() time.Time
 
-	entries      map[string]*entry
+	entries map[string]*entry
 	// onDisk is the set of keys present in the wrapped storage, listed once
 	// at start (loadKeys) and kept current by every flush. nil when the
 	// wrapped storage cannot list its keys; unseen keys are then "unknown".
