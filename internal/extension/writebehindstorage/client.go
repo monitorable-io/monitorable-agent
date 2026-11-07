@@ -3,6 +3,7 @@ package writebehindstorage
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -47,6 +48,12 @@ type client struct {
 	closed       bool
 	stop         chan struct{}
 	tickEvery    time.Duration
+
+	// Totals for the Close log line.
+	flushes           int
+	keysWritten       int
+	bytesWritten      int64
+	tombstonesWritten int
 }
 
 var _ storage.Client = (*client)(nil)
@@ -69,9 +76,118 @@ func newClientWithTicker(wrapped storage.Client, cfg Config, logger *zap.Logger,
 	}
 }
 
-// start launches the background flush check (Task 3); a no-op when
-// tickEvery is 0.
-func (c *client) start() {}
+// start launches the background flush check; a no-op when tickEvery is 0.
+// The goroutine ends when Close closes c.stop.
+func (c *client) start() {
+	if c.tickEvery <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(c.tickEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-c.stop:
+				return
+			case <-t.C:
+				c.tick(context.Background())
+			}
+		}
+	}()
+}
+
+// tick flushes when a flush is due (see dueLocked).
+func (c *client) tick(ctx context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	if reason := c.dueLocked(); reason != "" {
+		_ = c.flushLocked(ctx, reason)
+	}
+}
+
+// dueLocked reports why a flush is due, or "" when none is: pending bytes over
+// the cap, or a dirty entry (item or tombstone; never the metadata key alone)
+// that became dirty at least FlushAfter ago.
+func (c *client) dueLocked() string {
+	if c.pendingBytes > c.cfg.MaxBufferBytes {
+		return "max_buffer_bytes"
+	}
+	now := c.now()
+	for k, e := range c.entries {
+		if e.dirty && k != metadataKey && now.Sub(e.since) >= c.cfg.FlushAfter {
+			return "flush_after"
+		}
+	}
+	return ""
+}
+
+// flushLocked writes every dirty entry to the wrapped client in one Batch
+// (one bbolt transaction, so the file always holds a consistent snapshot):
+// a Set per dirty value, metadata included whenever dirty, and a Delete per
+// tombstone. On success tombstones are dropped and every entry but the
+// metadata key leaves memory (it is persisted; a later Get reads through).
+// On failure nothing changes, so the next flush retries the same writes.
+func (c *client) flushLocked(ctx context.Context, reason string) error {
+	keys := make([]string, 0, len(c.entries))
+	for k, e := range c.entries {
+		if e.dirty {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	// Deterministic order: metadata first, then the rest sorted.
+	sort.Slice(keys, func(i, j int) bool {
+		if (keys[i] == metadataKey) != (keys[j] == metadataKey) {
+			return keys[i] == metadataKey
+		}
+		return keys[i] < keys[j]
+	})
+	ops := make([]*storage.Operation, len(keys))
+	var nBytes int64
+	var tombstones int
+	for i, k := range keys {
+		e := c.entries[k]
+		if e.tombstone {
+			ops[i] = storage.DeleteOperation(k)
+			tombstones++
+		} else {
+			ops[i] = storage.SetOperation(k, e.value)
+			nBytes += int64(len(e.value))
+		}
+	}
+
+	start := time.Now()
+	if err := c.wrapped.Batch(ctx, ops...); err != nil {
+		return err
+	}
+	c.log.Debug("write_behind_storage flush",
+		zap.String("reason", reason),
+		zap.Int("keys", len(keys)-tombstones),
+		zap.Int64("bytes", nBytes),
+		zap.Int("tombstones", tombstones),
+		zap.Duration("took", time.Since(start)))
+	c.flushes++
+	c.keysWritten += len(keys) - tombstones
+	c.bytesWritten += nBytes
+	c.tombstonesWritten += tombstones
+
+	for k, e := range c.entries {
+		if k == metadataKey && !e.tombstone {
+			e.dirty, e.persisted = false, true
+			continue
+		}
+		// Applied tombstones, just-written items and clean read-through
+		// values alike: on disk now (or deleted there), so out of memory.
+		delete(c.entries, k)
+	}
+	c.pendingBytes = 0
+	return nil
+}
 
 func (c *client) Get(ctx context.Context, key string) ([]byte, error) {
 	op := storage.GetOperation(key)
@@ -100,6 +216,11 @@ func (c *client) Batch(ctx context.Context, ops ...*storage.Operation) error {
 		if err := c.applyLocked(ctx, op); err != nil {
 			return err
 		}
+	}
+	// The cap is checked once per call, after the whole Batch, so a flush
+	// never splits one queue transaction (metadata + item) across snapshots.
+	if c.pendingBytes > c.cfg.MaxBufferBytes {
+		_ = c.flushLocked(ctx, "max_buffer_bytes")
 	}
 	return nil
 }
@@ -196,6 +317,7 @@ func (c *client) Close(ctx context.Context) error {
 		return nil
 	}
 	c.closed = true
+	close(c.stop)
 	return c.wrapped.Close(ctx)
 }
 
