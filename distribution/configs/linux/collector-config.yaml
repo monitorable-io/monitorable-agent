@@ -75,8 +75,9 @@ processors:
         action: upsert
 
 extensions:
-  # Persistent sending queue for otlp_http. Batches wait here, on disk, until the
-  # backend accepts them — across collector restarts and multi-hour outages.
+  # Persistent sending queue for otlp_http. Batches that the backend has not
+  # accepted survive collector restarts and multi-hour outages in a bbolt file
+  # under this directory (exporter_otlp_http__metrics).
   # /var/lib/monitorable is the unit's only ReadWritePaths entry and is owned by
   # the monitorable user; the subdirectory is created on first start.
   # MONITORABLE_STATE_DIR overrides the path (CI uses a temp dir).
@@ -84,8 +85,8 @@ extensions:
     directory: ${env:MONITORABLE_STATE_DIR:-/var/lib/monitorable/queue}
     create_directory: true
     timeout: 10s
-    # At ~two bbolt writes per minute the fsync cost is nil, and it's what makes the
-    # queue survive power loss, not only process restarts.
+    # Every flush from write_behind_storage below is one fsynced transaction, so
+    # what is on disk survives power loss, not only process restarts.
     fsync: true
     compaction:
       # Shrink the bbolt file after a long outage drains, and at start.
@@ -95,6 +96,19 @@ extensions:
       # timeout 30s) leaves a tempdb* copy in the directory; this removes it at the next start.
       cleanup_on_start: true
       directory: ${env:MONITORABLE_STATE_DIR:-/var/lib/monitorable/queue}
+
+  # Write-behind layer the queue uses in front of file_storage (same file, same
+  # format). A batch that is sent within flush_after never touches the disk; one
+  # still waiting after flush_after (a slow or unreachable backend) is written
+  # out, together with the queue's metadata, in one transaction. Pending bytes
+  # above max_buffer_bytes are written at once, and a graceful stop (SIGTERM,
+  # systemctl stop/restart) writes everything first. A hard kill or power cut
+  # loses at most the batches younger than flush_after. Nothing is dropped by
+  # this layer. Rollback: set sending_queue.storage back to file_storage.
+  write_behind_storage:
+    storage: file_storage
+    flush_after: 15s
+    max_buffer_bytes: 4194304  # 4 MiB
 
 exporters:
   otlp_http:
@@ -124,11 +138,14 @@ exporters:
       sizer: requests
       queue_size: 1440
       block_on_overflow: false
-      storage: file_storage
+      storage: write_behind_storage
     compression: gzip
 
 service:
-  extensions: [file_storage]
+  # Order matters: extensions start in this order and stop in reverse, so
+  # file_storage is up before write_behind_storage and still up while it
+  # writes out its last batches at shutdown.
+  extensions: [file_storage, write_behind_storage]
   # Internal self-telemetry is disabled: nothing in Monitorable scrapes the collector's
   # own metrics, and the default Prometheus exporter binds 127.0.0.1:8888 — a fixed port
   # that crash-loops the collector if it is already in use on the host. `level: none`

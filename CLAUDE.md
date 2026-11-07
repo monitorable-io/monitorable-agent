@@ -33,6 +33,7 @@ GOOS=linux GOARCH=arm64 go build -o monitorable-agent-linux-arm64 cmd/monitorabl
 cmd/monitorable-agent/main.go   # Entry point
 internal/
 ├── capabilities/                  # System capability detection
+├── extension/writebehindstorage/  # write_behind_storage: write-behind layer for the persistent queue
 ├── collectors/                    # Metric collectors (CPU, RAM, disk, etc.)
 ├── receiver/                      # OTel receiver implementation
 ├── sensors/                       # Temperature sensor reads (hwmon/thermal_zone)
@@ -68,8 +69,16 @@ internal/
 - **Persistent export queue (Linux)**: the `otlp_http` exporter retries forever
   (`max_elapsed_time: 0`) with a `file_storage`-backed persistent queue at
   `/var/lib/monitorable/queue` (1440 requests); `newFactories()` in
-  `cmd/monitorable-agent/main.go` registers the extension and
-  `TestShippedConfigsLoad` guards config/factory drift.
+  `cmd/monitorable-agent/main.go` registers the extensions and
+  `TestShippedConfigsLoad` guards config/factory drift. Since v1.7.0 the queue uses
+  `write_behind_storage` (`internal/extension/writebehindstorage`), a wrapper around
+  `file_storage` that holds writes in memory. It writes a batch out only once the batch has
+  waited 15 s (`flush_after`), when more than 4 MiB is pending, or at a graceful stop, so a
+  healthy agent writes nothing to disk after start; a hard kill loses at most 15 s. The client lists
+  the file's keys once at start (`storage.Walker`), so it knows exactly what is on disk.
+  Every flush is one `Batch`, a consistent snapshot. `service.extensions` must list
+  `file_storage` first. Spec:
+  `docs/superpowers/specs/2026-11-07-write-behind-queue-storage-design.md`.
 - **OTLP Export**: Sends metrics to backend via OTLP/HTTP
 - **API Key Auth**: `Authorization` header with server API key
 

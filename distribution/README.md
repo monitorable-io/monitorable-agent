@@ -259,6 +259,19 @@ still dropped immediately; when the queue is full the newest batch is rejected.
 misleading: those batches are re-read from disk and retried as soon as the collector is
 back.
 
+Since v1.7.0 the queue reaches the file through `write_behind_storage`, a wrapper around
+`file_storage` in this distribution (`internal/extension/writebehindstorage`). The file name
+and format do not change. A batch the backend accepts within `flush_after` (15 s) is never
+written to disk, so a healthy agent's queue writes nothing after start (start itself costs
+one key-listing transaction plus the `on_start` compaction). A batch still waiting after
+15 s, during an outage or a slow backend, is written out with the queue's metadata in one
+fsynced transaction. More than `max_buffer_bytes` (4 MiB) pending is written at once, and a
+graceful stop (`systemctl stop`/`restart`, SIGTERM) writes everything first. A hard kill or
+power cut loses at most the batches younger than 15 s. The wrapper never drops a batch. If a
+write fails, new batches are refused until a write succeeds, as `file_storage` refuses them
+when its disk fails. Rollback: set `sending_queue.storage` back to `file_storage`. Upgrades
+and downgrades both read the same file.
+
 ### The publish window
 
 `SHA256SUMS` is uploaded after every payload it covers, but the upload as a whole is not
