@@ -56,6 +56,7 @@ func (w *writeBehind) GetClient(ctx context.Context, kind component.Kind, id com
 		return nil, err
 	}
 	c := newClient(inner, w.cfg, w.logger, time.Now)
+	c.loadKeys(ctx)
 	c.start()
 	w.clients = append(w.clients, c)
 	return c, nil

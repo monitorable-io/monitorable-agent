@@ -43,6 +43,10 @@ type client struct {
 	now     func() time.Time
 
 	entries      map[string]*entry
+	// onDisk is the set of keys present in the wrapped storage, listed once
+	// at start (loadKeys) and kept current by every flush. nil when the
+	// wrapped storage cannot list its keys; unseen keys are then "unknown".
+	onDisk       map[string]struct{}
 	pendingBytes int64 // len(value) summed over dirty, non-tombstone entries
 	flushErr     error // last flush failure; cleared by a successful flush
 	closed       bool
@@ -74,6 +78,31 @@ func newClientWithTicker(wrapped storage.Client, cfg Config, logger *zap.Logger,
 		stop:      make(chan struct{}),
 		tickEvery: tickEvery,
 	}
+}
+
+// loadKeys lists the keys in the wrapped storage once, so the client knows
+// exactly which keys exist there: a Get of a key on no disk needs no read,
+// and a Delete of a key that is on disk always reaches it. file_storage
+// implements storage.Walker (one bbolt transaction at start; values are not
+// copied). Without a Walker, or if the walk fails, the client falls back to
+// treating unseen keys as unknown.
+func (c *client) loadKeys(ctx context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w, ok := c.wrapped.(storage.Walker)
+	if !ok {
+		c.log.Info("write_behind_storage: wrapped storage cannot list its keys; unseen keys are read through")
+		return
+	}
+	keys := map[string]struct{}{}
+	if err := w.Walk(ctx, func(key string, _ []byte) ([]*storage.Operation, error) {
+		keys[key] = struct{}{}
+		return nil, nil
+	}); err != nil {
+		c.log.Warn("write_behind_storage: listing the wrapped storage's keys failed; unseen keys are read through", zap.Error(err))
+		return
+	}
+	c.onDisk = keys
 }
 
 // start launches the background flush check; a no-op when tickEvery is 0.
@@ -198,6 +227,15 @@ func (c *client) flushLocked(ctx context.Context, reason string) error {
 	c.bytesWritten += nBytes
 	c.tombstonesWritten += tombstones
 
+	if c.onDisk != nil {
+		for _, op := range ops {
+			if op.Type == storage.Set {
+				c.onDisk[op.Key] = struct{}{}
+			} else {
+				delete(c.onDisk, op.Key)
+			}
+		}
+	}
 	for k, e := range c.entries {
 		if k == metadataKey && !e.tombstone {
 			e.dirty, e.persisted = false, true
@@ -291,10 +329,18 @@ func (c *client) getLocked(ctx context.Context, op *storage.Operation) error {
 		}
 		return nil
 	}
-	// Unknown key: read through. Only start-up recovery and outage drains get
-	// here. A hit is cached clean and persisted; a persisted item's value is
-	// dropped again at the next flush (see flushLocked), so this cache never
-	// outlives one window.
+	if c.onDisk != nil {
+		if _, ok := c.onDisk[op.Key]; !ok {
+			// On no disk: answer without touching the wrapped client (every
+			// file_storage Get is a bbolt Update transaction, i.e. a write).
+			op.Value = nil
+			return nil
+		}
+	}
+	// On disk (or unknowable without a key list): read through. Only start-up
+	// recovery and outage drains get here. A hit is cached clean and
+	// persisted; its value leaves memory at the next flush (see flushLocked),
+	// so this cache never outlives one window.
 	v, err := c.wrapped.Get(ctx, op.Key)
 	if err != nil {
 		return err
@@ -309,7 +355,13 @@ func (c *client) getLocked(ctx context.Context, op *storage.Operation) error {
 func (c *client) setLocked(key string, value []byte) {
 	e, ok := c.entries[key]
 	if !ok {
-		e = &entry{}
+		// Without a key list (wrapped storage is no storage.Walker) a key
+		// this client has not seen is taken as absent from disk: the queue
+		// only sets the metadata key and fresh item indices, and every
+		// snapshot on disk is consistent (metadata and items written in one
+		// transaction), so a fresh index is never already there.
+		_, onDisk := c.onDisk[key]
+		e = &entry{persisted: onDisk}
 		c.entries[key] = e
 	}
 	if e.dirty && !e.tombstone {
@@ -330,16 +382,15 @@ func (c *client) deleteLocked(key string) {
 		c.pendingBytes -= int64(len(e.value))
 	}
 	if ok && !e.persisted {
-		// Never reached the disk: nothing to undo there. A Set of a key this
-		// client has not seen creates a non-persisted entry: the queue only
-		// sets fresh item indices and the metadata key, and every snapshot on
-		// disk is consistent (metadata and items in one transaction), so a
-		// fresh index is never already on disk.
+		// Never reached the disk: nothing to undo there.
 		delete(c.entries, key)
 		return
 	}
 	if !ok {
-		e = &entry{persisted: true} // unknown: assume it may be on disk
+		if _, onDisk := c.onDisk[key]; c.onDisk != nil && !onDisk {
+			return // on no disk and not in memory: nothing to delete
+		}
+		e = &entry{persisted: true} // on disk, or unknowable: may be there
 		c.entries[key] = e
 	}
 	if !e.tombstone {

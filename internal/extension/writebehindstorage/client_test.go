@@ -38,12 +38,19 @@ func testConfig() Config {
 }
 
 // newTestClient returns a client with no background ticker (tests drive tick
-// by hand), its fake wrapped client, and its fake clock.
-func newTestClient(t *testing.T, cfg Config) (*client, *fakeClient, *fakeClock) {
+// by hand), its fake wrapped client, and its fake clock. disk holds key/value
+// pairs present in the wrapped storage before the client starts; the client
+// lists them at start (loadKeys) as it does against file_storage.
+func newTestClient(t *testing.T, cfg Config, disk ...string) (*client, *fakeClient, *fakeClock) {
 	t.Helper()
 	fake := newFakeClient()
+	for i := 0; i+1 < len(disk); i += 2 {
+		fake.disk[disk[i]] = []byte(disk[i+1])
+	}
 	clk := &fakeClock{t: time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)}
 	c := newClientWithTicker(fake, cfg, zap.NewNop(), clk.now, 0)
+	c.loadKeys(ctx)
+	fake.resetCalls()
 	return c, fake, clk
 }
 
@@ -85,8 +92,7 @@ func TestSteadyStateTouchesDiskNever(t *testing.T) {
 }
 
 func TestGetMissReadsThroughAndCaches(t *testing.T) {
-	c, fake, _ := newTestClient(t, testConfig())
-	fake.disk["k"] = []byte("v")
+	c, fake, _ := newTestClient(t, testConfig(), "k", "v")
 
 	for i := range 2 {
 		v, err := c.Get(ctx, "k")
@@ -112,7 +118,7 @@ func TestGetMissOfAbsentKeyReturnsNil(t *testing.T) {
 }
 
 func TestDeleteOfUnseenKeyIsTombstone(t *testing.T) {
-	c, fake, _ := newTestClient(t, testConfig())
+	c, fake, _ := newTestClient(t, testConfig(), "ri", "3")
 	if err := c.Delete(ctx, "ri"); err != nil {
 		t.Fatal(err)
 	}
@@ -161,8 +167,7 @@ func assertNoWrites(t *testing.T, f *fakeClient) {
 }
 
 func TestGetOfTombstoneIsNilWithoutReadThrough(t *testing.T) {
-	c, fake, _ := newTestClient(t, testConfig())
-	fake.disk["k"] = []byte("old")
+	c, fake, _ := newTestClient(t, testConfig(), "k", "old")
 	if err := c.Delete(ctx, "k"); err != nil {
 		t.Fatal(err)
 	}
@@ -292,8 +297,7 @@ func TestCapCheckedAtBatchBoundary(t *testing.T) {
 }
 
 func TestTombstoneAgesOut(t *testing.T) {
-	c, fake, clk := newTestClient(t, testConfig())
-	fake.disk["3"] = []byte("delivered")
+	c, fake, clk := newTestClient(t, testConfig(), "3", "delivered")
 	mustBatch(t, c, storage.SetOperation(metadataKey, []byte("meta")), storage.DeleteOperation("3"))
 
 	clk.advance(window)
@@ -308,8 +312,7 @@ func TestTombstoneAgesOut(t *testing.T) {
 }
 
 func TestReviveAfterTombstone(t *testing.T) {
-	c, fake, clk := newTestClient(t, testConfig())
-	fake.disk["k"] = []byte("old")
+	c, fake, clk := newTestClient(t, testConfig(), "k", "old")
 	if err := c.Delete(ctx, "k"); err != nil {
 		t.Fatal(err)
 	}
@@ -378,8 +381,7 @@ func TestPendingBytesTracksDeletesAndEviction(t *testing.T) {
 }
 
 func TestGetOfUnseenThenDeleteReachesDisk(t *testing.T) {
-	c, fake, clk := newTestClient(t, testConfig())
-	fake.disk["wi"] = []byte("5")
+	c, fake, clk := newTestClient(t, testConfig(), "wi", "5")
 	v, err := c.Get(ctx, "wi")
 	if err != nil || string(v) != "5" {
 		t.Fatalf("Get wi = %q, %v", v, err)
@@ -399,8 +401,7 @@ func TestGetOfUnseenThenDeleteReachesDisk(t *testing.T) {
 // A cached read-through value of an item key is dropped at the next flush,
 // so memory stays flat while an outage backlog drains.
 func TestReadThroughItemEvictedAtFlush(t *testing.T) {
-	c, fake, clk := newTestClient(t, testConfig())
-	fake.disk["9"] = []byte("backlog")
+	c, _, clk := newTestClient(t, testConfig(), "9", "backlog")
 	if _, err := c.Get(ctx, "9"); err != nil {
 		t.Fatal(err)
 	}
@@ -419,8 +420,7 @@ func TestReadThroughItemEvictedAtFlush(t *testing.T) {
 var errDisk = errors.New("disk on fire")
 
 func TestCloseFlushesEverything(t *testing.T) {
-	c, fake, _ := newTestClient(t, testConfig())
-	fake.disk["1"] = []byte("delivered")
+	c, fake, _ := newTestClient(t, testConfig(), "1", "delivered")
 	mustBatch(t, c,
 		storage.SetOperation(metadataKey, []byte("meta")),
 		storage.SetOperation("2", []byte("pending")),
@@ -620,7 +620,7 @@ func TestShutdownAfterQueueCloseClosesWrappedOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := fs.client.(*fakeClient)
-	assertCalls(t, fake, "Batch[Set 1]", "Close")
+	assertCalls(t, fake, "Walk", "Batch[Set 1]", "Close")
 }
 
 func TestShutdownClosesUnclosedClients(t *testing.T) {
@@ -639,7 +639,7 @@ func TestShutdownClosesUnclosedClients(t *testing.T) {
 	if err := ext.Shutdown(ctx); err != nil {
 		t.Fatal(err)
 	}
-	assertCalls(t, fs.client.(*fakeClient), "Batch[Set 1]", "Close")
+	assertCalls(t, fs.client.(*fakeClient), "Walk", "Batch[Set 1]", "Close")
 }
 
 // A failure streak whose backlog drained (only metadata left dirty) must
@@ -667,5 +667,98 @@ func TestFailureStreakClearsWhenNothingPending(t *testing.T) {
 	c.tick(ctx)
 	if c.flushErr != nil {
 		t.Fatalf("flushErr = %v with nothing pending, want cleared", c.flushErr)
+	}
+}
+
+// --- exact on-disk key knowledge (Task 5 model finding) ---
+
+func TestDeleteOfKeyAbsentFromDiskLeavesNothing(t *testing.T) {
+	c, fake, clk := newTestClient(t, testConfig())
+	if err := c.Delete(ctx, "ri"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.entries["ri"]; ok {
+		t.Fatal("delete of a key that is on no disk left an entry")
+	}
+	clk.advance(window)
+	c.tick(ctx)
+	assertNoCalls(t, fake)
+}
+
+func TestGetOfKeyAbsentFromDiskDoesNotReadThrough(t *testing.T) {
+	c, fake, _ := newTestClient(t, testConfig())
+	v, err := c.Get(ctx, "5")
+	if err != nil || v != nil {
+		t.Fatalf("Get = %q, %v; want nil, nil", v, err)
+	}
+	// Every file_storage Get is a bbolt Update transaction (a meta page write
+	// and an fsync), so a miss must not reach it.
+	assertNoCalls(t, fake)
+}
+
+// A key that is on disk but was never seen in this process, Set and then
+// deleted: the delete must reach the disk, or the old value resurfaces.
+func TestSetOfUnseenDiskKeyThenDeleteReachesDisk(t *testing.T) {
+	c, fake, clk := newTestClient(t, testConfig(), "4", "old")
+	if err := c.Set(ctx, "4", []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, "4"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := c.Get(ctx, "4"); v != nil {
+		t.Fatalf("Get after delete = %q, want nil", v)
+	}
+	clk.advance(window)
+	c.tick(ctx)
+	if _, ok := fake.disk["4"]; ok {
+		t.Fatal("old value of 4 still on disk")
+	}
+}
+
+// A key flushed (and evicted) earlier in this process, Set again and then
+// deleted: same rule.
+func TestFlushedKeyRewrittenThenDeletedReachesDisk(t *testing.T) {
+	c, fake, clk := newTestClient(t, testConfig())
+	if err := c.Set(ctx, "4", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(window)
+	c.tick(ctx)
+	if err := c.Set(ctx, "4", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, "4"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := c.Get(ctx, "4"); v != nil {
+		t.Fatalf("Get after delete = %q, want nil", v)
+	}
+	clk.advance(window)
+	c.tick(ctx)
+	if _, ok := fake.disk["4"]; ok {
+		t.Fatal("flushed value of 4 still on disk")
+	}
+}
+
+// noWalker hides the fake's Walk: storage that cannot list its keys.
+type noWalker struct{ storage.Client }
+
+// Without a Walker the client cannot know what is on disk: a Get of an
+// unseen key reads through and a Delete of an unseen key is a tombstone.
+func TestWithoutWalkerUnseenKeysMayBeOnDisk(t *testing.T) {
+	fake := newFakeClient()
+	fake.disk["k"] = []byte("v")
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	c := newClientWithTicker(noWalker{fake}, testConfig(), zap.NewNop(), clk.now, 0)
+	c.loadKeys(ctx)
+	if v, err := c.Get(ctx, "k"); err != nil || string(v) != "v" {
+		t.Fatalf("Get = %q, %v", v, err)
+	}
+	if err := c.Delete(ctx, "other"); err != nil {
+		t.Fatal(err)
+	}
+	if e := c.entries["other"]; e == nil || !e.tombstone {
+		t.Fatalf("entry = %+v, want tombstone", e)
 	}
 }

@@ -16,8 +16,9 @@ type fakeClient struct {
 	mu     sync.Mutex
 	disk   map[string][]byte
 	calls  []string
-	err    error
-	closed int
+	err     error
+	closed  int
+	commits int // successful Batches that changed disk
 }
 
 func newFakeClient() *fakeClient { return &fakeClient{disk: map[string][]byte{}} }
@@ -60,6 +61,12 @@ func (f *fakeClient) Batch(_ context.Context, ops ...*storage.Operation) error {
 		return f.err
 	}
 	for _, op := range ops {
+		if op.Type != storage.Get {
+			f.commits++
+			break
+		}
+	}
+	for _, op := range ops {
 		switch op.Type {
 		case storage.Get:
 			op.Value = clone(f.disk[op.Key])
@@ -67,6 +74,27 @@ func (f *fakeClient) Batch(_ context.Context, ops ...*storage.Operation) error {
 			f.disk[op.Key] = clone(op.Value)
 		case storage.Delete:
 			delete(f.disk, op.Key)
+		}
+	}
+	return nil
+}
+
+// Walk implements storage.Walker like file_storage: fn sees every key and
+// value; the ops it returns are applied in the same transaction.
+func (f *fakeClient) Walk(_ context.Context, fn storage.WalkFunc) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "Walk")
+	if f.err != nil {
+		return f.err
+	}
+	for k, v := range f.disk {
+		ops, err := fn(k, v)
+		if err != nil {
+			return err
+		}
+		if len(ops) > 0 {
+			panic("fake Walk: write ops not supported")
 		}
 	}
 	return nil
@@ -90,6 +118,12 @@ func (f *fakeClient) callLog() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.calls...)
+}
+
+func (f *fakeClient) commitCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.commits
 }
 
 func (f *fakeClient) resetCalls() {
