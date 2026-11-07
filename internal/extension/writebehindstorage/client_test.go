@@ -3,13 +3,16 @@ package writebehindstorage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // fakeClock is a hand-advanced clock for the client's now func.
@@ -408,5 +411,261 @@ func TestReadThroughItemEvictedAtFlush(t *testing.T) {
 	c.tick(ctx)
 	if _, ok := c.entries["9"]; ok {
 		t.Fatal("read-through item 9 still cached after a flush")
+	}
+}
+
+// --- Task 4: close and failure semantics ---
+
+var errDisk = errors.New("disk on fire")
+
+func TestCloseFlushesEverything(t *testing.T) {
+	c, fake, _ := newTestClient(t, testConfig())
+	fake.disk["1"] = []byte("delivered")
+	mustBatch(t, c,
+		storage.SetOperation(metadataKey, []byte("meta")),
+		storage.SetOperation("2", []byte("pending")),
+		storage.DeleteOperation("1"))
+	if err := c.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	assertCalls(t, fake, "Batch[Set qmv0,Delete 1,Set 2]", "Close")
+	if string(fake.disk["2"]) != "pending" || fake.disk["1"] != nil {
+		t.Fatalf("disk after Close = %v", fake.disk)
+	}
+}
+
+func TestCloseTwiceIsSafe(t *testing.T) {
+	c, fake, _ := newTestClient(t, testConfig())
+	if err := c.Set(ctx, "1", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if err := c.Close(ctx); err != nil {
+			t.Fatalf("Close #%d: %v", i+1, err)
+		}
+	}
+	assertCalls(t, fake, "Batch[Set 1]", "Close")
+}
+
+func TestOperationsAfterCloseFail(t *testing.T) {
+	c, _, _ := newTestClient(t, testConfig())
+	if err := c.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Set(ctx, "1", []byte("x")); !errors.Is(err, errClosed) {
+		t.Fatalf("Set after Close = %v, want errClosed", err)
+	}
+}
+
+func TestCloseReportsFailedFlushAndStillClosesWrapped(t *testing.T) {
+	c, fake, _ := newTestClient(t, testConfig())
+	if err := c.Set(ctx, "1", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	fake.setErr(errDisk)
+	if err := c.Close(ctx); !errors.Is(err, errDisk) {
+		t.Fatalf("Close with failing flush = %v, want errDisk", err)
+	}
+	if fake.closed != 1 {
+		t.Fatalf("wrapped closed %d times, want 1", fake.closed)
+	}
+}
+
+// ageAndFailFlush sets an item, ages it past the window and runs one tick
+// against a failing disk.
+func ageAndFailFlush(t *testing.T, c *client, fake *fakeClient, clk *fakeClock) {
+	t.Helper()
+	mustBatch(t, c, storage.SetOperation(metadataKey, []byte("m1")), storage.SetOperation("1", []byte("item1")))
+	fake.setErr(errDisk)
+	clk.advance(window)
+	c.tick(ctx)
+	if len(fake.callLog()) != 1 {
+		t.Fatalf("expected one failed flush attempt, calls = %v", fake.callLog())
+	}
+}
+
+func TestFlushErrorSurfacesOnOfferOnly(t *testing.T) {
+	c, fake, clk := newTestClient(t, testConfig())
+	ageAndFailFlush(t, c, fake, clk)
+
+	// Read path: Batch(Set metadata, Get item) must not see the error, or the
+	// queue would finish (delete) a good batch.
+	get := storage.GetOperation("1")
+	if err := c.Batch(ctx, storage.SetOperation(metadataKey, []byte("m2")), get); err != nil {
+		t.Fatalf("read Batch after failed flush = %v, want nil", err)
+	}
+	if string(get.Value) != "item1" {
+		t.Fatalf("read Batch Get = %q, want item1", get.Value)
+	}
+	if _, err := c.Get(ctx, metadataKey); err != nil {
+		t.Fatalf("Get after failed flush = %v, want nil", err)
+	}
+	// Delete path: only logged by the queue; must not see it either.
+	if err := c.Delete(ctx, "1"); err != nil {
+		t.Fatalf("Delete after failed flush = %v, want nil", err)
+	}
+	if err := c.Batch(ctx, storage.SetOperation(metadataKey, []byte("m3")), storage.DeleteOperation("1")); err != nil {
+		t.Fatalf("finish Batch after failed flush = %v, want nil", err)
+	}
+
+	// Offer path: Batch(Set metadata, Set item) gets the error and stores nothing.
+	if err := c.Batch(ctx, storage.SetOperation(metadataKey, []byte("m4")), storage.SetOperation("2", []byte("item2"))); !errors.Is(err, errDisk) {
+		t.Fatalf("offer Batch after failed flush = %v, want errDisk", err)
+	}
+	if _, ok := c.entries["2"]; ok {
+		t.Fatal("rejected offer was buffered anyway; memory would grow while the disk fails")
+	}
+	if got := string(c.entries[metadataKey].value); got != "m3" {
+		t.Fatalf("metadata = %q after a rejected offer, want m3 (untouched)", got)
+	}
+	if err := c.Set(ctx, "2", []byte("item2")); !errors.Is(err, errDisk) {
+		t.Fatalf("single Set of an item after failed flush = %v, want errDisk", err)
+	}
+	if err := c.Set(ctx, metadataKey, []byte("m5")); err != nil {
+		t.Fatalf("Set of metadata alone after failed flush = %v, want nil", err)
+	}
+
+	// Disk recovers: the next due tick flushes and the error clears.
+	fake.setErr(nil)
+	fake.resetCalls()
+	c.tick(ctx)
+	if len(fake.callLog()) != 1 {
+		t.Fatalf("recovery tick calls = %v, want one Batch", fake.callLog())
+	}
+	if err := c.Batch(ctx, storage.SetOperation(metadataKey, []byte("m6")), storage.SetOperation("3", []byte("item3"))); err != nil {
+		t.Fatalf("offer after successful flush = %v, want nil", err)
+	}
+}
+
+func TestFlushErrorKeepsStateForRetry(t *testing.T) {
+	c, fake, clk := newTestClient(t, testConfig())
+	ageAndFailFlush(t, c, fake, clk)
+	before := c.pendingBytes
+	if before != int64(len("m1")+len("item1")) {
+		t.Fatalf("pendingBytes = %d", before)
+	}
+	for _, k := range []string{metadataKey, "1"} {
+		if e := c.entries[k]; e == nil || !e.dirty {
+			t.Fatalf("entry %s = %+v after failed flush, want still dirty", k, e)
+		}
+	}
+	if len(fake.disk) != 0 {
+		t.Fatalf("disk = %v after failed flush, want empty", fake.disk)
+	}
+	// It stays due, so every tick retries.
+	c.tick(ctx)
+	if n := len(fake.callLog()); n != 2 {
+		t.Fatalf("calls after second tick = %d, want 2 (retry)", n)
+	}
+}
+
+func TestFlushErrorLoggedOncePerStreak(t *testing.T) {
+	core, logs := observer.New(zap.ErrorLevel)
+	fake := newFakeClient()
+	clk := &fakeClock{t: time.Unix(0, 0)}
+	c := newClientWithTicker(fake, testConfig(), zap.New(core), clk.now, 0)
+
+	ageAndFailFlush(t, c, fake, clk)
+	c.tick(ctx)
+	c.tick(ctx)
+	if n := logs.Len(); n != 1 {
+		t.Fatalf("error logs after a 3-attempt failure streak = %d, want 1", n)
+	}
+	fake.setErr(nil)
+	c.tick(ctx)
+	mustBatch(t, c, storage.SetOperation("2", []byte("x")))
+	fake.setErr(errDisk)
+	clk.advance(window)
+	c.tick(ctx)
+	if n := logs.Len(); n != 2 {
+		t.Fatalf("error logs after a second streak = %d, want 2", n)
+	}
+}
+
+// A cap-triggered flush that fails leaves the offer that triggered it
+// buffered (it was applied) and returns nil for it; the next offer fails.
+func TestCapFlushFailureFailsNextOffer(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxBufferBytes = 10
+	c, fake, _ := newTestClient(t, cfg)
+	fake.setErr(errDisk)
+	if err := c.Set(ctx, "1", bytes.Repeat([]byte("a"), 20)); err != nil {
+		t.Fatalf("offer that tripped the cap = %v, want nil (it is buffered)", err)
+	}
+	if _, ok := c.entries["1"]; !ok {
+		t.Fatal("offer that tripped the cap is not buffered")
+	}
+	if err := c.Set(ctx, "2", []byte("b")); !errors.Is(err, errDisk) {
+		t.Fatalf("next offer = %v, want errDisk", err)
+	}
+}
+
+func TestShutdownAfterQueueCloseClosesWrappedOnce(t *testing.T) {
+	fs := &fakeStorageExt{}
+	ext := newExt(t, NewFactory().CreateDefaultConfig().(*Config))
+	if err := ext.Start(ctx, hostWith{component.MustNewID("file_storage"): fs}); err != nil {
+		t.Fatal(err)
+	}
+	cl, err := ext.GetClient(ctx, component.KindExporter, component.MustNewID("otlp_http"), "metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Set(ctx, "1", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := ext.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fake := fs.client.(*fakeClient)
+	assertCalls(t, fake, "Batch[Set 1]", "Close")
+}
+
+func TestShutdownClosesUnclosedClients(t *testing.T) {
+	fs := &fakeStorageExt{}
+	ext := newExt(t, NewFactory().CreateDefaultConfig().(*Config))
+	if err := ext.Start(ctx, hostWith{component.MustNewID("file_storage"): fs}); err != nil {
+		t.Fatal(err)
+	}
+	cl, err := ext.GetClient(ctx, component.KindExporter, component.MustNewID("otlp_http"), "metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Set(ctx, "1", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ext.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCalls(t, fs.client.(*fakeClient), "Batch[Set 1]", "Close")
+}
+
+// A failure streak whose backlog drained (only metadata left dirty) must
+// still retry and clear, or offers would be refused forever.
+func TestFailureStreakRetriesWithOnlyMetadataDirty(t *testing.T) {
+	c, fake, clk := newTestClient(t, testConfig())
+	ageAndFailFlush(t, c, fake, clk)
+	mustBatch(t, c, storage.SetOperation(metadataKey, []byte("m2")), storage.DeleteOperation("1"))
+	fake.setErr(nil)
+	fake.resetCalls()
+	c.tick(ctx)
+	assertCalls(t, fake, "Batch[Set qmv0]")
+	if err := c.Set(ctx, "2", []byte("x")); err != nil {
+		t.Fatalf("offer after recovery = %v, want nil", err)
+	}
+}
+
+// With nothing dirty at all, the next tick clears the error.
+func TestFailureStreakClearsWhenNothingPending(t *testing.T) {
+	c, fake, clk := newTestClient(t, testConfig())
+	ageAndFailFlush(t, c, fake, clk)
+	c.flushErr = errDisk
+	c.entries = map[string]*entry{}
+	c.pendingBytes = 0
+	c.tick(ctx)
+	if c.flushErr != nil {
+		t.Fatalf("flushErr = %v with nothing pending, want cleared", c.flushErr)
 	}
 }

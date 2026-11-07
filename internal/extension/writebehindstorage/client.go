@@ -111,7 +111,15 @@ func (c *client) tick(ctx context.Context) {
 // dueLocked reports why a flush is due, or "" when none is: pending bytes over
 // the cap, or a dirty entry (item or tombstone; never the metadata key alone)
 // that became dirty at least FlushAfter ago.
+//
+// During a failure streak every tick retries: offers are refused until a
+// flush succeeds, and if the backlog drained meanwhile only the metadata key
+// may be left dirty, which would otherwise never trigger the flush that
+// clears the error.
 func (c *client) dueLocked() string {
+	if c.flushErr != nil {
+		return "retry"
+	}
 	if c.pendingBytes > c.cfg.MaxBufferBytes {
 		return "max_buffer_bytes"
 	}
@@ -138,6 +146,8 @@ func (c *client) flushLocked(ctx context.Context, reason string) error {
 		}
 	}
 	if len(keys) == 0 {
+		// Nothing pending: an earlier failure no longer holds anything back.
+		c.flushErr = nil
 		return nil
 	}
 	// Deterministic order: metadata first, then the rest sorted.
@@ -163,7 +173,19 @@ func (c *client) flushLocked(ctx context.Context, reason string) error {
 
 	start := time.Now()
 	if err := c.wrapped.Batch(ctx, ops...); err != nil {
+		if c.flushErr == nil {
+			c.log.Error("write_behind_storage flush failed; pending writes stay in memory and new queue offers fail until a flush succeeds",
+				zap.String("reason", reason),
+				zap.Int("keys", len(keys)),
+				zap.Int64("bytes", nBytes),
+				zap.Error(err))
+		}
+		c.flushErr = err
 		return err
+	}
+	if c.flushErr != nil {
+		c.log.Info("write_behind_storage flush succeeded after earlier failures")
+		c.flushErr = nil
 	}
 	c.log.Debug("write_behind_storage flush",
 		zap.String("reason", reason),
@@ -212,6 +234,14 @@ func (c *client) Batch(ctx context.Context, ops ...*storage.Operation) error {
 	if c.closed {
 		return errClosed
 	}
+	// A failed flush surfaces only on offers, and an offer that meets it is
+	// stored nowhere (as a failing bbolt transaction stores nothing), so
+	// memory stays bounded while the disk fails. Reads and deletes never see
+	// it: the queue finishes (deletes) an item whose read fails, and only logs
+	// a failed delete.
+	if c.flushErr != nil && isOffer(ops) {
+		return c.flushErr
+	}
 	for _, op := range ops {
 		if err := c.applyLocked(ctx, op); err != nil {
 			return err
@@ -223,6 +253,17 @@ func (c *client) Batch(ctx context.Context, ops ...*storage.Operation) error {
 		_ = c.flushLocked(ctx, "max_buffer_bytes")
 	}
 	return nil
+}
+
+// isOffer reports whether ops are offer-shaped: they Set a key other than the
+// metadata key (the queue's offer is Batch(Set metadata, Set item)).
+func isOffer(ops []*storage.Operation) bool {
+	for _, op := range ops {
+		if op.Type == storage.Set && op.Key != metadataKey {
+			return true
+		}
+	}
+	return false
 }
 
 // applyLocked applies one operation to memory; c.mu is held.
@@ -309,7 +350,11 @@ func (c *client) deleteLocked(key string) {
 	e.tombstone = true
 }
 
-// Close is completed in a later task; for now it closes the wrapped client.
+// Close stops the background check, writes everything pending, and closes
+// the wrapped client. It is idempotent: the queue closes its client when its
+// last reference goes, and the extension's Shutdown closes any client still
+// open, so the second call is a no-op. The wrapped client is closed even when
+// the final flush fails (the collector is stopping; the error is returned).
 func (c *client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -318,7 +363,13 @@ func (c *client) Close(ctx context.Context) error {
 	}
 	c.closed = true
 	close(c.stop)
-	return c.wrapped.Close(ctx)
+	flushErr := c.flushLocked(ctx, "close")
+	c.log.Info("write_behind_storage client closed",
+		zap.Int("flushes", c.flushes),
+		zap.Int("keys_written", c.keysWritten),
+		zap.Int64("bytes_written", c.bytesWritten),
+		zap.Int("tombstones_written", c.tombstonesWritten))
+	return errors.Join(flushErr, c.wrapped.Close(ctx))
 }
 
 func clone(b []byte) []byte {
