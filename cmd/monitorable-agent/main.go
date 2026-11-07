@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 
+	"github.com/monitorable-io/monitorable-agent/internal/extension/writebehindstorage"
 	"github.com/monitorable-io/monitorable-agent/internal/receiver/monitorable"
 	"github.com/monitorable-io/monitorable-agent/internal/version"
 )
@@ -56,6 +57,9 @@ func newFactories() otelcol.Factories {
 	factories.Extensions = map[component.Type]extension.Factory{
 		// Persistent sending queue for otlp_http (distribution config: extensions.file_storage).
 		component.MustNewType("file_storage"): filestorage.NewFactory(),
+		// Write-behind wrapper around file_storage the queue actually uses: batches sent within
+		// flush_after never reach the disk (distribution config: extensions.write_behind_storage).
+		component.MustNewType("write_behind_storage"): writebehindstorage.NewFactory(),
 	}
 
 	// Set up connectors (empty)

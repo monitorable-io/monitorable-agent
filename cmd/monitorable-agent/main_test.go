@@ -34,6 +34,10 @@ func TestFactoriesRegisterShippedComponents(t *testing.T) {
 	if _, ok := f.Extensions[component.MustNewType("file_storage")]; !ok {
 		t.Error("extension \"file_storage\" is not registered; the shipped persistent queue would fail to start")
 	}
+	// Write-behind wrapper the shipped queue uses (sending_queue.storage: write_behind_storage).
+	if _, ok := f.Extensions[component.MustNewType("write_behind_storage")]; !ok {
+		t.Error("extension \"write_behind_storage\" is not registered; the shipped persistent queue would fail to start")
+	}
 	if _, ok := f.Extensions[component.MustNewType("health_check")]; ok {
 		t.Error("extension \"health_check\" is registered; nothing uses it and it binds a port when configured")
 	}
