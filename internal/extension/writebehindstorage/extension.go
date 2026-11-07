@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
@@ -54,8 +55,10 @@ func (w *writeBehind) GetClient(ctx context.Context, kind component.Kind, id com
 	if err != nil {
 		return nil, err
 	}
-	w.clients = append(w.clients, inner)
-	return inner, nil
+	c := newClient(inner, w.cfg, w.logger, time.Now)
+	c.start()
+	w.clients = append(w.clients, c)
+	return c, nil
 }
 
 // Shutdown closes every client this extension handed out that its owner did

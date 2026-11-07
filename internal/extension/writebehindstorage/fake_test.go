@@ -107,10 +107,3 @@ func (f *fakeClient) snapshot() map[string][]byte {
 	}
 	return out
 }
-
-func clone(b []byte) []byte {
-	if b == nil {
-		return nil
-	}
-	return append([]byte{}, b...)
-}
