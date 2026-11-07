@@ -71,11 +71,15 @@ Anti-goals
   lost window leaves is mostly silent.
 - `file_storage`'s `Batch` is one bbolt transaction (fsync as configured), so a flush
   that carries metadata and items in one `Batch` is crash-atomic.
-- Extensions start in the order of `service.extensions` and stop in reverse (collector
-  service v0.162.0). The wrapper looks `file_storage` up at runtime and declares no
-  dependency, so `[file_storage, write_behind_storage]` is what guarantees the wrapped
-  store is alive while the wrapper flushes at shutdown. A shipped-config test asserts
-  that order (6).
+- ~~Extensions start in the order of `service.extensions` and stop in reverse.~~
+  Corrected in review (PR #35): collector service v0.162.0 orders extensions by a
+  topological sort over declared dependencies (`extensioncapabilities.Dependent`) and
+  otherwise follows map order, not the list. The wrapper therefore declares
+  `Dependencies() = [storage]`, which starts `file_storage` first and stops it last. The
+  shipped-config test checks that both are listed; a unit test checks the dependency.
+- A graceful stop reaches the flush only after in-flight sends return (up to the 30 s
+  otlp_http client timeout against a blackholed backend), so the unit's `TimeoutStopSec`
+  is 45 s (was 10 s). Found in review (PR #35); `TestShippedConfigsLoad` pins it.
 
 ## 4. Approaches considered
 
