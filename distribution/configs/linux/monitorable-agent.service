@@ -14,7 +14,11 @@ ExecStart=/opt/monitorable/monitorable-agent --config=/etc/monitorable/collector
 EnvironmentFile=/etc/monitorable/agent.env
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=10
+# 45 s, not less: the persistent queue's write-behind layer writes its pending batches to
+# disk only after in-flight sends return, and a send to an unreachable (blackholed) backend
+# returns at the otlp_http client timeout (30 s). A SIGKILL before that loses the batches of
+# the last minute. TestShippedConfigsLoad pins TimeoutStopSec >= client timeout + 10 s.
+TimeoutStopSec=45
 Restart=always
 RestartSec=10
 LimitNOFILE=65536

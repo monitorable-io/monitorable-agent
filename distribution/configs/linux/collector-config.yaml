@@ -92,8 +92,8 @@ extensions:
       # Shrink the bbolt file after a long outage drains, and at start.
       on_start: true
       on_rebound: true
-      # A SIGKILL during compaction (the unit's TimeoutStopSec is 10s, the HTTP client
-      # timeout 30s) leaves a tempdb* copy in the directory; this removes it at the next start.
+      # A SIGKILL during compaction (e.g. at the unit's TimeoutStopSec) leaves a tempdb*
+      # copy in the directory; this removes it at the next start.
       cleanup_on_start: true
       directory: ${env:MONITORABLE_STATE_DIR:-/var/lib/monitorable/queue}
 
@@ -102,9 +102,13 @@ extensions:
   # still waiting after flush_after (a slow or unreachable backend) is written
   # out, together with the queue's metadata, in one transaction. Pending bytes
   # above max_buffer_bytes are written at once, and a graceful stop (SIGTERM,
-  # systemctl stop/restart) writes everything first. A hard kill or power cut
-  # loses at most the batches younger than flush_after. Nothing is dropped by
-  # this layer. Rollback: set sending_queue.storage back to file_storage.
+  # systemctl stop/restart) writes everything first, once in-flight sends have
+  # returned (up to the 30 s HTTP timeout; the unit's TimeoutStopSec=45 leaves
+  # room for that). A hard kill or power cut loses at most the batches younger
+  # than flush_after (plus up to the 1 s check interval). Nothing is dropped by
+  # this layer. It declares file_storage as a dependency, so the collector
+  # starts file_storage first and stops it last whatever the order below.
+  # Rollback: set sending_queue.storage back to file_storage.
   write_behind_storage:
     storage: file_storage
     flush_after: 15s
@@ -142,9 +146,8 @@ exporters:
     compression: gzip
 
 service:
-  # Order matters: extensions start in this order and stop in reverse, so
-  # file_storage is up before write_behind_storage and still up while it
-  # writes out its last batches at shutdown.
+  # Both must be listed. The start/stop order comes from write_behind_storage's
+  # declared dependency on file_storage, not from this list.
   extensions: [file_storage, write_behind_storage]
   # Internal self-telemetry is disabled: nothing in Monitorable scrapes the collector's
   # own metrics, and the default Prometheus exporter binds 127.0.0.1:8888 — a fixed port

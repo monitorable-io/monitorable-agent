@@ -76,8 +76,11 @@ internal/
   waited 15 s (`flush_after`), when more than 4 MiB is pending, or at a graceful stop, so a
   healthy agent writes nothing to disk after start; a hard kill loses at most 15 s. The client lists
   the file's keys once at start (`storage.Walker`), so it knows exactly what is on disk.
-  Every flush is one `Batch`, a consistent snapshot. `service.extensions` must list
-  `file_storage` first. Spec:
+  Every flush is one `Batch`, a consistent snapshot. The extension declares `file_storage`
+  as a dependency (`Dependencies()`): the collector orders extensions by dependencies,
+  not by the `service.extensions` list. A graceful stop flushes only after in-flight sends
+  return (up to the 30 s HTTP timeout), so the unit's `TimeoutStopSec` (45) must stay above
+  it; `TestShippedConfigsLoad` pins that. Spec:
   `docs/superpowers/specs/2026-11-07-write-behind-queue-storage-design.md`.
 - **OTLP Export**: Sends metrics to backend via OTLP/HTTP
 - **API Key Auth**: `Authorization` header with server API key

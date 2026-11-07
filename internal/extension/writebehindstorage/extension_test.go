@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/extension/extensioncapabilities"
 	"go.opentelemetry.io/collector/extension/extensiontest"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
 )
@@ -107,5 +108,21 @@ func TestGetClientBeforeStartFails(t *testing.T) {
 	ext := newExt(t, NewFactory().CreateDefaultConfig().(*Config))
 	if _, err := ext.GetClient(context.Background(), component.KindExporter, component.MustNewID("otlp_http"), "metrics"); err == nil {
 		t.Fatal("GetClient before Start = nil error, want error")
+	}
+}
+
+// The collector orders extension start/stop by declared dependencies, not by
+// service.extensions (v0.162.0 computeOrder topo-sorts a map). Declaring the
+// wrapped storage makes it start before and stop after this extension.
+func TestDependsOnWrappedStorage(t *testing.T) {
+	cfg := NewFactory().CreateDefaultConfig().(*Config)
+	cfg.Storage = component.MustNewIDWithName("file_storage", "queue")
+	var ext any = newExt(t, cfg)
+	dep, ok := ext.(extensioncapabilities.Dependent)
+	if !ok {
+		t.Fatal("write_behind_storage does not implement extensioncapabilities.Dependent")
+	}
+	if got := dep.Dependencies(); len(got) != 1 || got[0] != cfg.Storage {
+		t.Fatalf("Dependencies() = %v, want [%v]", got, cfg.Storage)
 	}
 }

@@ -262,14 +262,19 @@ back.
 Since v1.7.0 the queue reaches the file through `write_behind_storage`, a wrapper around
 `file_storage` in this distribution (`internal/extension/writebehindstorage`). The file name
 and format do not change. A batch the backend accepts within `flush_after` (15 s) is never
-written to disk, so a healthy agent's queue writes nothing after start (start itself costs
-one key-listing transaction plus the `on_start` compaction). A batch still waiting after
-15 s, during an outage or a slow backend, is written out with the queue's metadata in one
-fsynced transaction. More than `max_buffer_bytes` (4 MiB) pending is written at once, and a
-graceful stop (`systemctl stop`/`restart`, SIGTERM) writes everything first. A hard kill or
-power cut loses at most the batches younger than 15 s. The wrapper never drops a batch. If a
+written to disk, so a healthy agent's queue writes nothing after start. Start itself costs
+a few small bbolt transactions: `file_storage`'s own initialisation, the `on_start` compaction,
+the wrapper listing the file's keys, and the queue reading its metadata. A batch still
+waiting after 15 s, during an outage or a slow backend, is written out with the queue's
+metadata in one fsynced transaction. More than `max_buffer_bytes` (4 MiB) pending is written
+at once. A graceful stop (`systemctl stop`/`restart`, SIGTERM) writes everything first, but
+only after in-flight sends return, which against an unreachable backend takes up to the
+30 s HTTP timeout. The unit's `TimeoutStopSec=45` leaves room for that, and
+`TestShippedConfigsLoad` pins it above the client timeout plus 10 s. A hard kill or power cut
+loses at most the batches younger than 15 s (plus up to the 1 s check interval). The wrapper never drops a batch. If a
 write fails, new batches are refused until a write succeeds, as `file_storage` refuses them
-when its disk fails. Rollback: set `sending_queue.storage` back to `file_storage`. Upgrades
+when its disk fails. The extension declares `file_storage` as a dependency, so the collector
+starts `file_storage` before it and stops it after. Rollback: set `sending_queue.storage` back to `file_storage`. Upgrades
 and downgrades both read the same file.
 
 ### The publish window

@@ -8,15 +8,16 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/extension/extensioncapabilities"
 	"go.opentelemetry.io/collector/extension/xextension/storage"
 	"go.uber.org/zap"
 )
 
 // writeBehind is the write_behind_storage extension. It resolves the wrapped
 // storage extension at Start and hands out clients that wrap the wrapped
-// extension's clients. It declares no dependency on the wrapped extension:
-// service.extensions must list the wrapped one first so that it starts before
-// and stops after this one.
+// extension's clients. It declares the wrapped extension as a dependency, so
+// the collector starts it first and stops it last (the collector orders
+// extensions by dependencies, not by the service.extensions list).
 type writeBehind struct {
 	cfg    Config
 	logger *zap.Logger
@@ -26,7 +27,16 @@ type writeBehind struct {
 	clients []storage.Client
 }
 
-var _ storage.Extension = (*writeBehind)(nil)
+var (
+	_ storage.Extension               = (*writeBehind)(nil)
+	_ extensioncapabilities.Dependent = (*writeBehind)(nil)
+)
+
+// Dependencies makes the collector start the wrapped storage before this
+// extension and stop it after, and refuse to start if it is not configured.
+func (w *writeBehind) Dependencies() []component.ID {
+	return []component.ID{w.cfg.Storage}
+}
 
 func (w *writeBehind) Start(_ context.Context, host component.Host) error {
 	ext, ok := host.GetExtensions()[w.cfg.Storage]
