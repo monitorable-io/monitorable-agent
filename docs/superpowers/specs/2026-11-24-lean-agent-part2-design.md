@@ -1,6 +1,6 @@
 # Lean agent Part 2: send when collected, TCP state counts without the process scan — Design
 
-Date: 2026-11-24. Status: draft for founder review. Target: agent v1.9.0.
+Date: 2026-11-24. Status: approved by the founder on 2026-11-24 (design and plan; execution Native). Target: agent v1.9.0.
 Part 1: `2026-11-24-lean-agent-build-design.md` (v1.8.0, live).
 
 ## 1. Why
