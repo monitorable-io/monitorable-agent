@@ -34,6 +34,7 @@ cmd/monitorable-agent/main.go   # Entry point
 internal/
 ├── capabilities/                  # System capability detection
 ├── extension/writebehindstorage/  # write_behind_storage: write-behind layer for the persistent queue
+├── processor/cyclebatch/          # cycle_batch: sends a collection cycle as soon as every receiver delivered
 ├── collectors/                    # Metric collectors (CPU, RAM, disk, etc.)
 ├── receiver/                      # OTel receiver implementation
 ├── selftelemetry/                 # Telemetry factory: console logger, no-op meters/tracers
@@ -58,7 +59,8 @@ internal/
   collector user must be in the `docker` group; if the socket is present but inaccessible
   the receiver logs an actionable WARN.
 - **Listening ports**: the `monitorable` receiver samples `/proc/net/tcp{,6}` every 10s
-  (LISTEN = state `0A`; connection counts = ESTABLISHED `01` only, keyed by local port) and,
+  (the ports list: LISTEN = state `0A`, per-port connection counts = ESTABLISHED `01`, keyed
+  by local port; the sampler also counts every state, see "TCP state counts") and,
   once per 60s cycle, attaches the `listening.ports` resource attribute plus
   `monitorable.port.connections{,.peak}` gauges (avg/peak over the window, `port` label) for the
   30 lowest ports; `all_ports` lists up to 1000. No addresses, peers, PIDs or command lines.
@@ -67,6 +69,27 @@ internal/
   publishes via iptables DNAT (and kube-proxy NodePorts) keep their client connections in the
   container's network namespace, so the host-side count reads near zero (docker-proxy holds the
   LISTEN; a NodePort has no host listener at all).
+- **Send when collected**: the `cycle_batch` processor (`internal/processor/cyclebatch`,
+  first in the pipeline) gathers one collection cycle — one `ConsumeMetrics` per receiver —
+  and sends it as one request as soon as `deliveries` have arrived (about 1.3 s after the
+  tick), or after `max_wait` (10 s) for a slow or silent collector; its clock starts at the
+  first delivery, and `Shutdown` hands a pending group downstream. `deliveries` must equal
+  the number of receivers in the metrics pipeline (2); `TestShippedConfigsLoad` pins it.
+  The stock `batch` behind it is a size limit only (`timeout: 0s`, 5,000 / 5,000): it splits
+  a cycle above 5,000 datapoints, because the backend refuses a request above 20,000. Before
+  v1.9.0 the stock step's free-running 60 s timer sent every sample about a minute late.
+  Spec: `docs/superpowers/specs/2026-11-24-lean-agent-part2-design.md`.
+- **TCP state counts**: `system.network.connections` (twelve `state` labels, `protocol=tcp`,
+  hostmetrics' shape) comes from the `monitorable` receiver, counted per row by the ports
+  sampler, from its newest sample (stamped with that sample's time). The shipped config
+  switches the metric off in hostmetrics, whose library opens `/proc/<pid>/fd` of every
+  process for it. Config `monitorable.tcp_states.mode: auto|on|off`: the default in the
+  binary is `off` (so a v1.9.0 binary with a v1.8.0 config keeps hostmetrics' counts and
+  sends each series once), the shipped config sets `auto`. `ports.mode: off` does not stop
+  the counts: each cycle then reads the tables itself, with no sampler goroutine. Two known
+  differences from hostmetrics: listeners sharing a port (`SO_REUSEPORT`) count one each,
+  as `ss -ltn` shows them (the library merged them into one); and `FIN_WAIT_1`/`FIN_WAIT_2`
+  carry the real counts (the library sent them as `FIN_WAIT1`/`FIN_WAIT2`, extra series).
 - **Persistent export queue (Linux)**: the `otlp_http` exporter retries forever
   (`max_elapsed_time: 0`) with a `file_storage`-backed persistent queue at
   `/var/lib/monitorable/queue` (1440 requests); `newFactories()` in

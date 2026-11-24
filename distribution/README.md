@@ -259,9 +259,10 @@ of a customer's install.
 host that needs a systemd drop-in — the shipped unit's `EnvironmentFile=` only sets
 `MONITORABLE_API_KEY` and `MONITORABLE_ENDPOINT`, from `/etc/monitorable/agent.env`).
 The queue holds 1440 batches — stored as uncompressed protobuf,
-typically 50-100 KB each → typically well under 150 MB (a busy host with
-`send_batch_size: 3000` can flush more than one batch a minute, so 1440 requests may be
-less than a day there) — and survives collector restarts. Permanent errors (4xx, 500) are
+typically 50-100 KB each → typically well under 150 MB (a collection cycle above 5,000
+datapoints is sent as more than one request, so 1440 requests may be less than a day on
+such a host) — and survives collector restarts. Since v1.9.0 a request is sent about a
+second after its cycle is collected (`cycle_batch`), not up to a minute later. Permanent errors (4xx, 500) are
 still dropped immediately; when the queue is full the newest batch is rejected.
 `cmd/monitorable-agent/main.go` registers the extension. A "Dropping data … interrupted due to shutdown" log line at a restart is
 misleading: those batches are re-read from disk and retried as soon as the collector is

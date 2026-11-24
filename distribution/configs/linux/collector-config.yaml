@@ -9,7 +9,8 @@
 #
 # Docker container metrics are collected by the monitorable receiver, which probes
 # the Docker socket each collection cycle and emits container metrics only when
-# a usable socket is present. Collection cadence is controlled by the batch processor.
+# a usable socket is present. Each receiver collects every collection_interval;
+# the cycle_batch processor sends a cycle as soon as both have delivered.
 
 receivers:
   # Standard OTel host metrics. The selection below is what the backend's data
@@ -53,10 +54,14 @@ receivers:
           match_type: regexp
         metrics:
           system.filesystem.inodes.usage: {enabled: false}
-      network:        # system.network.{io,packets,dropped,errors,connections}
+      network:        # system.network.{io,packets,dropped,errors}
         exclude:
           interfaces: ['^(lo|docker0|veth.+|br-.+)$']
           match_type: regexp
+        metrics:
+          # Sent by the monitorable receiver (tcp_states below) since v1.9.0.
+          # hostmetrics would open /proc/<pid>/fd of every process to count it.
+          system.network.connections: {enabled: false}
       paging:         # system.paging.usage{state=...} (swap)
         metrics:
           system.paging.operations: {enabled: false}
@@ -70,9 +75,16 @@ receivers:
 
   monitorable:
     # The monitorable receiver collects host metadata + uptime, CPU temperature
-    # and frequency. Collection frequency is controlled by the batch processor.
+    # and frequency, once per collection_interval.
     collection_interval: 60s
     capability_interval: 24h
+
+    # system.network.connections (TCP sockets per state), counted from the ports
+    # sampler's reads of /proc/net/tcp{,6}. ports.mode: off does not stop them:
+    # each collection cycle then reads the tables itself. The binary's default is
+    # off, so an older config keeps hostmetrics' counts.
+    tcp_states:
+      mode: auto
 
     # Announces this server over IPv4 and IPv6 (an empty POST /v1/probe, hourly)
     # so the dashboard can show both addresses. Same endpoint and key as the
@@ -83,13 +95,23 @@ receivers:
       interval: 1h
 
 processors:
+  cycle_batch:
+    # Gathers one collection cycle (one delivery per receiver) into one request
+    # and sends it as soon as every receiver has delivered, about a second after
+    # the cycle starts. max_wait bounds a cycle where a collector is slow or
+    # silent. deliveries is the number of receivers in the metrics pipeline;
+    # TestShippedConfigsLoad pins it.
+    deliveries: 2
+    max_wait: 10s
+
   batch:
-    # The batch processor controls how often data is sent to the backend.
-    # timeout: maximum time between sends (effectively the collection interval)
-    # send_batch_size: triggers a send when this many data points are collected
-    send_batch_size: 3000
+    # Size limit only. timeout 0 passes every group through at once and
+    # ignores send_batch_size; a group above send_batch_max_size is split (the
+    # backend refuses a request above 20,000 datapoints). send_batch_size must
+    # still be stated: its default (8192) is above the max and would be refused.
+    timeout: 0s
+    send_batch_size: 5000
     send_batch_max_size: 5000
-    timeout: 60s  # Send data every 60 seconds
 
   resource:
     attributes:
@@ -155,8 +177,8 @@ exporters:
       max_elapsed_time: 0
     # queue_size counts BATCHES (sizer: requests): 1440 = one day at one batch per
     # minute. Stored as uncompressed protobuf, typically 50-100 KB each → typically
-    # well under 150 MB. A busy host (send_batch_size: 3000) can flush more than one
-    # batch a minute, so 1440 requests may be less than a day there.
+    # well under 150 MB. A cycle above 5,000 datapoints is sent as more than one
+    # request, so 1440 requests may be less than a day on such a host.
     # When full, the NEWEST batch is rejected (block_on_overflow: false) so a
     # receiver never blocks on export.
     sending_queue:
@@ -183,5 +205,5 @@ service:
   pipelines:
     metrics:
       receivers: [host_metrics, monitorable]
-      processors: [batch, resource]
+      processors: [cycle_batch, batch, resource]
       exporters: [otlp_http]
