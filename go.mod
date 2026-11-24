@@ -7,6 +7,7 @@ toolchain go1.27.4
 require (
 	github.com/anatol/smart.go v0.0.0-20260913233941-486c28b93357
 	github.com/coreos/go-systemd/v22 v22.7.0
+	github.com/docker/go-units v0.5.0
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/moby/moby/api v1.56.1
 	github.com/moby/moby/client v0.6.1
@@ -63,7 +64,6 @@ require (
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-connections v0.8.1 // indirect
-	github.com/docker/go-units v0.5.0 // indirect
 	github.com/ebitengine/purego v0.11.1 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/foxboron/go-tpm-keyfiles v0.0.0-20260902202739-8c9c2d1005f4 // indirect
