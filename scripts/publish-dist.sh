@@ -290,12 +290,16 @@ mkdir -p "$OUT/configs/linux"
 cp -R "$SRC/configs/linux/." "$OUT/configs/linux/"
 
 # 3. Cross-compile binaries (CGO off for static, portable artifacts). Linux only.
+# -s -w: no debug info and no symbol table (about half the download; neither is ever
+# loaded, so memory does not change). Panics still print stack traces with function
+# names, and --version / `go version -m` still work. CI's "Release binary size budget"
+# step fails above 33,000,000 B (amd64) / 31,000,000 B (arm64).
 build() { # os arch ext
   local os="$1" arch="$2" ext="${3:-}"
   echo "building ${os}/${arch}"
   GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
     go build -C "$ROOT" \
-    -ldflags "-X github.com/monitorable-io/monitorable-agent/internal/version.Version=${VERSION}" \
+    -ldflags "-s -w -X github.com/monitorable-io/monitorable-agent/internal/version.Version=${VERSION}" \
     -o "$BINOUT/monitorable-agent-${os}-${arch}${ext}" \
     cmd/monitorable-agent/main.go
 }

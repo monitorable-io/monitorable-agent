@@ -36,6 +36,7 @@ internal/
 ├── extension/writebehindstorage/  # write_behind_storage: write-behind layer for the persistent queue
 ├── collectors/                    # Metric collectors (CPU, RAM, disk, etc.)
 ├── receiver/                      # OTel receiver implementation
+├── selftelemetry/                 # Telemetry factory: console logger, no-op meters/tracers
 ├── sensors/                       # Temperature sensor reads (hwmon/thermal_zone)
 └── version/                       # Build-time version string (ldflags injection)
 ```
@@ -82,6 +83,23 @@ internal/
   return (up to the 30 s HTTP timeout), so the unit's `TimeoutStopSec` (45) must stay above
   it; `TestShippedConfigsLoad` pins that. Spec:
   `docs/superpowers/specs/2026-11-07-write-behind-queue-storage-design.md`.
+- **Self-telemetry**: `factories.Telemetry` is our own `internal/selftelemetry`, not the
+  collector's stock `otelconftelemetry`, which links the AWS, Kubernetes, GCP and OAuth
+  dependency trees (45 modules, about 15 MB of binary) for internal metrics and traces the
+  shipped config turns off. It builds the stock console logger (minus the `resource` block on
+  every line; sampling 10 s / first 10 / every 100th) with no-op meters and tracers, and reads
+  `service::telemetry::{logs::level, logs::encoding, metrics::level}` only. Every other key
+  loads and is ignored, with one WARN naming the keys; `metrics::level` other than `none` gets
+  one WARN ("internal metrics are not available in this build"). `TestBinaryLinksNoStockTelemetry`
+  guards the import graph and CI's "Release binary size budget" step the stripped release
+  artifacts (≤ 33,000,000 B amd64, ≤ 31,000,000 B arm64). Spec:
+  `docs/superpowers/specs/2026-11-24-lean-agent-build-design.md`.
+- **Collected set**: the shipped `host_metrics` config is pruned to the backend's data catalog
+  (16 hostmetrics names; devices matching the backend's ingest deny pattern
+  `^(lo|docker0|veth.+|br-.+|loop\d+|/dev/loop\d+)$` are excluded). A metric added to the
+  catalog later has to be switched on in the config, in an agent release.
+  `TestShippedHostMetricsEmitOnlyStoredSeries` runs the shipped receiver and fails on any
+  name or device the backend would drop.
 - **OTLP Export**: Sends metrics to backend via OTLP/HTTP
 - **API Key Auth**: `Authorization` header with server API key
 

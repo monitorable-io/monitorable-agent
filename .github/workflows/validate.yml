@@ -180,6 +180,11 @@ jobs:
           # and the --preflight `s3 s3 cp` don't match `put<space>…install.sh`, so this stays
           # at exactly one on the current script.
           test "$(grep -cE '^[[:space:]]*put[[:space:]].*install\.sh' scripts/publish-dist.sh)" -eq 1
+      - name: Release binary size budget (stripped, no stock telemetry)
+        run: |
+          grep -q -- '-ldflags "-s -w -X ' scripts/publish-dist.sh
+          test "$(stat -c %s distribution-build/binaries/otel/monitorable-agent-linux-amd64)" -le 33000000
+          test "$(stat -c %s distribution-build/binaries/otel/monitorable-agent-linux-arm64)" -le 31000000
       - name: Distribution backstop checker (scripts/test-check-published-dist.sh)
         run: scripts/test-check-published-dist.sh
       - name: Distribution backstop trigger (scripts/test-dispatch-dist-backstop.sh)

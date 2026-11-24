@@ -214,6 +214,14 @@ refused before signing) and `RELEASE_SIGNING_KEY`, which must match
 `distribution/keys/<env>.pub`. A publish or `--preflight` also needs
 `BUNNY_STORAGE_PASSWORD` (not `--render-only`, which never uploads).
 
+Release binaries are linked with `-s -w` (since v1.8.0): no debug info and no symbol
+table, about half the download (linux/amd64 about 29 MB instead of 57 MB). Neither is
+loaded at run time, so memory does not change; panics still print stack traces with
+function names, and `--version` and `go version -m` still work. CI's "Release binary size
+budget" step builds the artifacts the way this script does and fails above 33,000,000 bytes
+(amd64) or 31,000,000 bytes (arm64), and `TestBinaryLinksNoStockTelemetry` fails when the
+import graph regains the collector's stock telemetry factory or what only it pulled in.
+
 Uploads go over R2's **S3 API** with the AWS CLI (preinstalled on GitHub runners). The
 credentials are `CLOUDFLARE_R2_TOKEN` — an R2 API token with **Object Read & Write**
 scoped to that one bucket — and `CLOUDFLARE_ACCOUNT_ID`; the S3 key pair is derived from
