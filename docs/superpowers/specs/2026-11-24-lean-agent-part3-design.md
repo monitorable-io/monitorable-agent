@@ -1,6 +1,6 @@
 # Lean agent Part 3: inspect a container only when it has changed — Design
 
-Date: 2026-11-24. Status: draft for founder review. Target: agent v1.10.0.
+Date: 2026-11-24. Status: approved by the founder on 2026-11-24. Target: agent v1.10.0.
 Part 1: `2026-11-24-lean-agent-build-design.md` (v1.8.0, live).
 Part 2: `2026-11-24-lean-agent-part2-design.md` (v1.9.0, live).
 
@@ -301,8 +301,9 @@ Expected on the development host, per cycle:
 ## 6. Compatibility and rollout
 
 - **Config:** unchanged, so the v1.10.0 binary runs with the v1.9.0 config and
-  the v1.9.0 binary with the v1.10.0 config. `MIN_VERSION` in the installer
-  stays `v1.9.0`.
+  the v1.9.0 binary with the v1.10.0 config. The installer's `MIN_VERSION`
+  becomes `v1.10.0`, as the publish script sets it to the tag on every
+  release; nothing in this change needs it.
 - **Dependencies:** `github.com/docker/go-units` moves from indirect to direct
   in `go.mod`. It is already linked (the Docker API types import it), so the
   binary does not grow beyond the new code.
@@ -358,11 +359,9 @@ On a staging server that runs containers, updated from v1.9.0:
 
 ## 8. Public statements
 
-- **Founder ruling needed: changelog entry or not.** Nothing a user sees,
-  does, receives or pays for changes, so the project's rule says no entry.
-  Default proposed here: no changelog entry; the GitHub release notes say
-  what changed. An entry would be justified only as part of the lean-agent
-  story, and then it needs the founder's wording.
+- **No changelog entry**, ruled by the founder on 2026-11-24: nothing a user
+  sees, does, receives or pays for changes. The GitHub release notes say what
+  changed.
 - No site or docs wording depends on this change.
 - The agent's `CLAUDE.md` ("Docker container snapshot") and
   `agent_docs/procedures/collector-distribution.md`, if it describes the
