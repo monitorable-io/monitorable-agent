@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with: { go-version-file: go.mod, cache: true }
       - name: Test gate
         run: go build ./... && go vet ./... && go test -race ./...
@@ -141,7 +141,7 @@ jobs:
           git checkout -q "refs/tags/$TAG"
           git checkout -q "$TOOLING_SHA" -- scripts/publish-dist.sh
           echo "artifacts from tag $TAG = $(git rev-parse --short "refs/tags/$TAG"); publish-dist.sh from ${TOOLING_SHA:0:7}"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with: { go-version-file: go.mod, cache: true }
       - name: Test gate
         run: go build ./... && go vet ./... && go test -race ./...
