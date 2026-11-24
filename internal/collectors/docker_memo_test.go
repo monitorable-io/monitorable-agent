@@ -34,6 +34,11 @@ func TestHumanDurationWording(t *testing.T) {
 		{1439 * time.Hour, "8 weeks"},
 		{1440 * time.Hour, "2 months"},
 		{17519 * time.Hour, "24 months"},
+		// go-units rounds hours half up below two years but truncates them for years, so
+		// "1 years" covers the half hour just under 17520h.
+		{17519*time.Hour + 29*time.Minute + 59*time.Second, "24 months"},
+		{17519*time.Hour + 30*time.Minute, "1 years"},
+		{17519*time.Hour + 59*time.Minute + 59*time.Second, "1 years"},
 		{17520 * time.Hour, "2 years"},
 	}
 	for _, c := range cases {
@@ -65,7 +70,20 @@ func TestHumanDurationNeverGoesBack(t *testing.T) {
 		visit(d)
 	}
 	for d := 3 * time.Hour; d <= 3*365*24*time.Hour; d += time.Hour {
+		if units.HumanDuration(d) != current {
+			// The wording changed within the last hour: walk that hour in 1 s steps,
+			// so a wording shorter than the coarse step is seen in its place.
+			for f := d - time.Hour + time.Second; f < d; f += time.Second {
+				visit(f)
+			}
+		}
 		visit(d)
+	}
+	// The walk must see every wording, including ones shorter than its step.
+	for _, w := range []string{"About an hour", "47 hours", "2 days", "13 days", "2 weeks", "8 weeks", "2 months", "24 months", "1 years", "2 years"} {
+		if !left[w] && current != w {
+			t.Errorf("the walk never saw wording %q", w)
+		}
 	}
 }
 

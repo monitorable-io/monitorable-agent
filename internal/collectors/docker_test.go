@@ -35,9 +35,13 @@ type fakeAPI struct {
 	closed     int
 
 	inspectCalls map[string]int // per ID, counted also when inspectErr is returned
+	onList       func()         // runs inside ContainerList (a test clock moving during the call)
 }
 
 func (f *fakeAPI) ContainerList(_ context.Context, _ client.ContainerListOptions) (client.ContainerListResult, error) {
+	if f.onList != nil {
+		f.onList()
+	}
 	if f.listErr != nil {
 		return client.ContainerListResult{}, f.listErr
 	}
@@ -617,6 +621,59 @@ func TestCollectReusesInspectOnQuietHost(t *testing.T) {
 	}
 	if api.inspectCalls["c1"] != 1 || api.inspectCalls["c2"] != 1 {
 		t.Errorf("after cycle 3: inspect calls = %v, want still 1 each", api.inspectCalls)
+	}
+}
+
+// TestCollectChecksFromBeforeTheListCall pins spec 4.1: an entry's "checked" time is
+// the reading taken before the list call, not after it. Anything the list does not show
+// yet may have happened while the call ran (a stop becomes visible up to 32 s late), so a
+// slow list call must not move the horizon forward. Here the list call takes 50 s.
+func TestCollectChecksFromBeforeTheListCall(t *testing.T) {
+	clock := &fakeClock{at: memoBase}
+	t0 := clock.at.Wall
+	started := t0.Add(-60 * time.Second)
+	api := &fakeAPI{
+		items:     []ctypes.Summary{runningSummary("c1", "app", "img")},
+		statsBody: sampleStats,
+		inspect:   map[string]ctypes.InspectResponse{"c1": runningInspect(started, 0)},
+	}
+	slowList := func() {
+		api.items[0].Status = upStatus(clock.at.Wall, started) // Docker formats as the call starts
+		clock.advance(50 * time.Second)
+	}
+	d := newCollectorWithClock(api, clock)
+
+	// Cycle 1 at t0: first sight, inspected. The list call ends at t0+50s.
+	api.onList = slowList
+	d.Collect(context.Background())
+	if got := d.memo["c1"].Checked.Wall; !got.Equal(t0) {
+		t.Fatalf("after an inspect: Checked = %v, want the reading before the list call (%v)", got, t0)
+	}
+	if got := d.memo["c1"].Inspected.Wall; !got.Equal(t0) {
+		t.Fatalf("Inspected = %v, want the reading before the list call (%v)", got, t0)
+	}
+
+	// Cycle 2 at t0+600s with a quick list: age 660 s ("11 minutes") equals the horizon
+	// from t0 (600 s + 60 s slack), so the container is inspected. From the reading after
+	// cycle 1's list (t0+50s) the horizon would be 610 s ("10 minutes"), a wrong reuse.
+	api.onList = func() { api.items[0].Status = upStatus(clock.at.Wall, started) }
+	clock.advance(550 * time.Second)
+	d.Collect(context.Background())
+	if api.inspectCalls["c1"] != 2 {
+		t.Fatalf("cycle 2: inspect calls = %d, want 2 (the horizon runs from before cycle 1's list call)", api.inspectCalls["c1"])
+	}
+
+	// Cycle 3 at t0+660s, slow list again: reused, and Checked moves to this cycle's
+	// reading before the list call (t0+660s), not after it (t0+710s).
+	api.onList = slowList
+	clock.advance(60 * time.Second)
+	cycle3 := clock.at.Wall
+	d.Collect(context.Background())
+	if api.inspectCalls["c1"] != 2 {
+		t.Fatalf("cycle 3: inspect calls = %d, want still 2 (reused)", api.inspectCalls["c1"])
+	}
+	if got := d.memo["c1"].Checked.Wall; !got.Equal(cycle3) {
+		t.Errorf("after a reuse: Checked = %v, want the reading before the list call (%v)", got, cycle3)
 	}
 }
 
