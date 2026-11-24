@@ -146,7 +146,7 @@ func TestSummarizeSockets_ScopeAndFamilies(t *testing.T) {
 		row("10.0.0.5", 6379, tcpStateListen),
 	}
 	v6 := []tcpRow{row("::", 22, tcpStateListen)}
-	l, _ := summarizeSockets(v4, v6)
+	l, _, _ := summarizeSockets(v4, v6)
 
 	if f := l[22]; f == nil || f.Loopback || !f.V4 || !f.V6 {
 		t.Errorf("22 = %+v, want non-loopback V4+V6", f)
@@ -173,7 +173,7 @@ func TestSummarizeSockets_CountsEstablishedOnly(t *testing.T) {
 		row("10.0.0.5", 22, 0x08), // CLOSE_WAIT
 		row("10.0.0.5", 9000, tcpStateEstablished),
 	}
-	l, est := summarizeSockets(v4, nil)
+	l, est, _ := summarizeSockets(v4, nil)
 	if est[22] != 2 {
 		t.Errorf("established[22] = %d, want 2", est[22])
 	}
@@ -190,7 +190,7 @@ func TestSummarizeSockets_V6OnlyWildcardCountsMappedPeers(t *testing.T) {
 		row("::", 443, tcpStateListen),
 		row("::ffff:10.0.0.5", 443, tcpStateEstablished),
 	}
-	l, est := summarizeSockets(nil, v6)
+	l, est, _ := summarizeSockets(nil, v6)
 	if f := l[443]; f == nil || f.V4 || !f.V6 || f.Loopback {
 		t.Errorf("443 = %+v, want V6 only, non-loopback", f)
 	}
@@ -212,6 +212,62 @@ func TestIsLoopback(t *testing.T) {
 	} {
 		if got := isLoopback(netip.MustParseAddr(addr)); got != want {
 			t.Errorf("isLoopback(%s) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
+func TestSummarizeSockets_CountsEveryState(t *testing.T) {
+	v4 := []tcpRow{
+		row("10.0.0.1", 22, 0x0A), row("10.0.0.1", 22, 0x01), row("10.0.0.1", 22, 0x01),
+		row("10.0.0.1", 443, 0x06), row("10.0.0.1", 443, 0x06), row("10.0.0.1", 443, 0x08),
+		row("10.0.0.1", 5000, 0x04), row("10.0.0.1", 5001, 0x0C), // 0x0C: not a state we know
+	}
+	v6 := []tcpRow{row("::", 22, 0x0A), row("::1", 9000, 0x01)}
+	_, _, states := summarizeSockets(v4, v6)
+	got := states.ByLabel()
+	want := map[string]int64{"ESTABLISHED": 3, "LISTEN": 2, "TIME_WAIT": 2, "CLOSE_WAIT": 1, "FIN_WAIT_1": 1}
+	if len(got) != 12 {
+		t.Fatalf("ByLabel has %d labels, want 12", len(got))
+	}
+	for _, label := range TCPStateLabels {
+		if got[label] != want[label] {
+			t.Errorf("%s = %d, want %d", label, got[label], want[label])
+		}
+	}
+}
+
+func TestSummarizeSockets_SharedPortListenersCountEach(t *testing.T) {
+	v4 := []tcpRow{
+		row("0.0.0.0", 80, 0x0A), row("0.0.0.0", 80, 0x0A),
+		row("0.0.0.0", 80, 0x0A), row("0.0.0.0", 80, 0x0A),
+	}
+	listeners, _, states := summarizeSockets(v4, nil)
+	if got := states.ByLabel()["LISTEN"]; got != 4 {
+		t.Errorf("LISTEN = %d, want 4 (one per listening socket, as ss -ltn shows)", got)
+	}
+	if len(listeners) != 1 {
+		t.Errorf("listeners = %d, want 1 (the ports list merges by port)", len(listeners))
+	}
+}
+
+func TestTCPStateCounts_AllTwelveStateCodesMapToTheirLabels(t *testing.T) {
+	want := map[uint8]string{
+		0x01: "ESTABLISHED", 0x02: "SYN_SENT", 0x03: "SYN_RECV", 0x04: "FIN_WAIT_1",
+		0x05: "FIN_WAIT_2", 0x06: "TIME_WAIT", 0x07: "CLOSE", 0x08: "CLOSE_WAIT",
+		0x09: "LAST_ACK", 0x0A: "LISTEN", 0x0B: "CLOSING",
+	}
+	for code, label := range want {
+		var c TCPStateCounts
+		c[code] = 7
+		got := c.ByLabel()
+		for _, l := range TCPStateLabels {
+			wantN := int64(0)
+			if l == label {
+				wantN = 7
+			}
+			if got[l] != wantN {
+				t.Errorf("code %#02x: %s = %d, want %d", code, l, got[l], wantN)
+			}
 		}
 	}
 }

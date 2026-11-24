@@ -120,6 +120,9 @@ func TestShippedHostMetricsEmitOnlyStoredSeries(t *testing.T) {
 				ms := sms.At(j).Metrics()
 				for k := 0; k < ms.Len(); k++ {
 					checkStoredMetric(t, ms.At(k))
+					if ms.At(k).Name() == "system.network.connections" {
+						t.Errorf("host_metrics emits system.network.connections: the monitorable receiver sends it since v1.9.0; hostmetrics would scan /proc/<pid>/fd for it")
+					}
 				}
 			}
 		}

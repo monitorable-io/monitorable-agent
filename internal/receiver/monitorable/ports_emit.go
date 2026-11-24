@@ -45,21 +45,57 @@ func (r *metricsReceiver) runPortsSampler(ctx context.Context, interval time.Dur
 	}
 }
 
-// collectListeningPorts attaches the window's listening-ports snapshot as the
-// `listening.ports` resource attribute and appends the per-port connection gauges
-// to metrics, once per collection cycle. No-op when ports.mode=off or when the
-// window holds no usable sample (agent just started, or /proc/net/tcp unreadable).
-func (r *metricsReceiver) collectListeningPorts(_ context.Context, attrs pcommon.Map, metrics pmetric.MetricSlice) {
+// runsPortsSampler reports whether the sampler goroutine runs: only for the
+// ports list. With ports.mode off and tcp_states on, each collection cycle
+// takes its own sample instead.
+func (r *metricsReceiver) runsPortsSampler() bool {
+	return r.portsCollector != nil && r.portsMode != PortsModeOff
+}
+
+// sampleInCycle takes one /proc/net/tcp{,6} sample inside the collection cycle.
+// A failure is not logged here; the Snapshot status transition reports it.
+func (r *metricsReceiver) sampleInCycle(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, portsSampleTimeout)
+	defer cancel()
+	_ = r.portsCollector.Sample(cctx, time.Now())
+}
+
+// collectListeningPorts runs once per collection cycle. With ports.mode on it
+// attaches the window's listening-ports snapshot as the `listening.ports`
+// resource attribute and appends the per-port connection gauges; with
+// tcp_states.mode on it appends system.network.connections from the window's
+// newest sample. The first cycle can run before the sampler's first sample, and
+// with ports.mode off there is no sampler: in both cases the cycle samples
+// itself. Nothing is emitted when /proc/net/tcp is unreadable.
+func (r *metricsReceiver) collectListeningPorts(ctx context.Context, attrs pcommon.Map, metrics pmetric.MetricSlice) {
 	if r.portsCollector == nil {
-		return // ports.mode=off
+		return // ports.mode and tcp_states.mode both off
+	}
+	portsOn := r.portsMode != PortsModeOff
+	statesOn := r.tcpStatesMode == TCPStatesModeAuto || r.tcpStatesMode == TCPStatesModeOn
+
+	if !portsOn {
+		r.sampleInCycle(ctx)
 	}
 	res := r.portsCollector.Snapshot(r.cfg.Ports.MaxPorts)
-	r.logPortsTransition(res.Status, res.Err)
-	if res.Status != collectors.PortsOK {
-		return
+	if portsOn && res.Status == collectors.PortsNoSamples {
+		r.sampleInCycle(ctx)
+		res = r.portsCollector.Snapshot(r.cfg.Ports.MaxPorts)
 	}
-	r.putBoundedJSON(attrs, "listening.ports", res.Snapshot, &r.portsJSONWarned)
-	buildPortMetrics(metrics, res.Snapshot)
+
+	if portsOn {
+		r.logPortsTransition(res.Status, res.Err)
+		if res.Status == collectors.PortsOK {
+			r.putBoundedJSON(attrs, "listening.ports", res.Snapshot, &r.portsJSONWarned)
+			buildPortMetrics(metrics, res.Snapshot)
+		}
+	}
+	if statesOn {
+		r.logTCPStatesTransition(res.Status, res.Err)
+		if res.States != nil {
+			buildTCPStateMetric(metrics, res.States)
+		}
+	}
 }
 
 // buildPortMetrics appends monitorable.port.connections (mean ESTABLISHED count,

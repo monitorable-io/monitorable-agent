@@ -22,7 +22,7 @@ func TestFactoriesRegisterShippedComponents(t *testing.T) {
 			t.Errorf("receiver %q is not registered", name)
 		}
 	}
-	for _, name := range []string{"batch", "resource"} {
+	for _, name := range []string{"cycle_batch", "batch", "resource"} {
 		if _, ok := f.Processors[component.MustNewType(name)]; !ok {
 			t.Errorf("processor %q is not registered", name)
 		}

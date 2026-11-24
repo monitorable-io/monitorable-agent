@@ -40,8 +40,10 @@ require (
 	go.opentelemetry.io/collector/otelcol v0.162.0
 	go.opentelemetry.io/collector/otelcol/otelcoltest v0.162.0
 	go.opentelemetry.io/collector/pdata v1.68.0
+	go.opentelemetry.io/collector/pipeline v1.68.0
 	go.opentelemetry.io/collector/processor v1.68.0
 	go.opentelemetry.io/collector/processor/batchprocessor v0.162.0
+	go.opentelemetry.io/collector/processor/processortest v0.162.0
 	go.opentelemetry.io/collector/receiver v1.68.0
 	go.opentelemetry.io/collector/receiver/receivertest v0.162.0
 	go.opentelemetry.io/collector/service v0.162.0
@@ -140,11 +142,9 @@ require (
 	go.opentelemetry.io/collector/pdata/pprofile v0.162.0 // indirect
 	go.opentelemetry.io/collector/pdata/testdata v0.162.0 // indirect
 	go.opentelemetry.io/collector/pdata/xpdata v0.162.0 // indirect
-	go.opentelemetry.io/collector/pipeline v1.68.0 // indirect
 	go.opentelemetry.io/collector/pipeline/xpipeline v0.162.0 // indirect
 	go.opentelemetry.io/collector/processor/processorhelper v0.162.0 // indirect
 	go.opentelemetry.io/collector/processor/processorhelper/xprocessorhelper v0.162.0 // indirect
-	go.opentelemetry.io/collector/processor/processortest v0.162.0 // indirect
 	go.opentelemetry.io/collector/processor/xprocessor v0.162.0 // indirect
 	go.opentelemetry.io/collector/receiver/receiverhelper v0.162.0 // indirect
 	go.opentelemetry.io/collector/receiver/xreceiver v0.162.0 // indirect

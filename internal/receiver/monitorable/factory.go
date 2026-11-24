@@ -42,6 +42,7 @@ func createDefaultConfig() component.Config {
 			SampleInterval: defaultPortsSampleInterval,
 			MaxPorts:       defaultPortsMaxPorts,
 		},
+		TCPStates:    TCPStatesConfig{Mode: TCPStatesModeOff},
 		AddressProbe: AddressProbeConfig{Interval: defaultAddressProbeInterval},
 	}
 }

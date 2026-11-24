@@ -13,8 +13,11 @@ import (
 	"go.opentelemetry.io/collector/config/configtelemetry"
 	"go.opentelemetry.io/collector/exporter/otlphttpexporter"
 	"go.opentelemetry.io/collector/otelcol/otelcoltest"
+	"go.opentelemetry.io/collector/pipeline"
+	"go.opentelemetry.io/collector/processor/batchprocessor"
 
 	"github.com/monitorable-io/monitorable-agent/internal/extension/writebehindstorage"
+	"github.com/monitorable-io/monitorable-agent/internal/processor/cyclebatch"
 	"github.com/monitorable-io/monitorable-agent/internal/receiver/monitorable"
 	"github.com/monitorable-io/monitorable-agent/internal/selftelemetry"
 )
@@ -44,6 +47,35 @@ func TestShippedConfigsLoad(t *testing.T) {
 	}
 	if string(rc.AddressProbe.APIKey) != "test-key" {
 		t.Errorf("address_probe.api_key does not carry the exporter key")
+	}
+
+	// Send when collected: cycle_batch gathers one collection cycle, the stock
+	// batch step behind it only splits an oversized cycle.
+	pipe := cfg.Service.Pipelines[pipeline.NewID(pipeline.SignalMetrics)]
+	wantProcs := []component.ID{component.MustNewID("cycle_batch"), component.MustNewID("batch"), component.MustNewID("resource")}
+	if !slices.Equal(pipe.Processors, wantProcs) {
+		t.Errorf("metrics pipeline processors = %v, want %v", pipe.Processors, wantProcs)
+	}
+	cb, ok := cfg.Processors[component.MustNewID("cycle_batch")].(*cyclebatch.Config)
+	if !ok {
+		t.Fatal("cycle_batch config missing or of the wrong type")
+	}
+	// One delivery per receiver per cycle: a receiver added without raising the
+	// count would make every cycle leave before it is complete.
+	if cb.Deliveries != len(pipe.Receivers) || cb.MaxWait != 10*time.Second {
+		t.Errorf("cycle_batch = %+v, want deliveries %d (the pipeline's receivers) and max_wait 10s", cb, len(pipe.Receivers))
+	}
+	bc, ok := cfg.Processors[component.MustNewID("batch")].(*batchprocessor.Config)
+	if !ok {
+		t.Fatal("batch config missing or of the wrong type")
+	}
+	// Size limit only: no timer, and a cycle above 5,000 datapoints is split
+	// (the backend refuses a request above 20,000).
+	if bc.Timeout != 0 || bc.SendBatchSize != 5000 || bc.SendBatchMaxSize != 5000 {
+		t.Errorf("batch = timeout %v size %d max %d, want 0 / 5000 / 5000", bc.Timeout, bc.SendBatchSize, bc.SendBatchMaxSize)
+	}
+	if rc.TCPStates.Mode != monitorable.TCPStatesModeAuto {
+		t.Errorf("tcp_states.mode = %q, want auto", rc.TCPStates.Mode)
 	}
 
 	// Write-behind queue storage. Both extensions must be listed; the start/stop
