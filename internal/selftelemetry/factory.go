@@ -64,7 +64,7 @@ func (c *Config) Validate() error {
 	case "console", "json":
 		return nil
 	}
-	return fmt.Errorf("service::telemetry::logs::encoding %q: must be console or json", c.Logs.Encoding)
+	return fmt.Errorf("logs::encoding %q: must be console or json", c.Logs.Encoding)
 }
 
 // IgnoredKeys lists the keys of the section that this build does not read,

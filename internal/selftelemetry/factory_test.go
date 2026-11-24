@@ -48,8 +48,14 @@ func TestUnknownKeysAreKeptAside(t *testing.T) {
 func TestValidateRejectsUnknownEncoding(t *testing.T) {
 	cfg := NewFactory().CreateDefaultConfig().(*Config)
 	cfg.Logs.Encoding = "xml"
-	if cfg.Validate() == nil {
+	err := cfg.Validate()
+	if err == nil {
 		t.Fatal("encoding xml accepted")
+	}
+	// confmap prefixes the section path ("service::telemetry: ..."); the
+	// message must not repeat it.
+	if msg := err.Error(); !strings.HasPrefix(msg, `logs::encoding "xml"`) {
+		t.Fatalf("error = %q, want it to start with the key relative to service::telemetry", msg)
 	}
 }
 
