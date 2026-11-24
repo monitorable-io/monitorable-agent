@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/collector/receiver"
 
 	"github.com/monitorable-io/monitorable-agent/internal/extension/writebehindstorage"
+	"github.com/monitorable-io/monitorable-agent/internal/processor/cyclebatch"
 	"github.com/monitorable-io/monitorable-agent/internal/receiver/monitorable"
 	"github.com/monitorable-io/monitorable-agent/internal/selftelemetry"
 	"github.com/monitorable-io/monitorable-agent/internal/version"
@@ -40,6 +41,11 @@ func newFactories() otelcol.Factories {
 
 	// Set up processors
 	factories.Processors = map[component.Type]processor.Factory{
+		// Sends each collection cycle as one request as soon as every receiver
+		// has delivered (spec 2026-11-24-lean-agent-part2-design.md, section 4).
+		component.MustNewType("cycle_batch"): cyclebatch.NewFactory(),
+		// Size limit only in the shipped config (timeout 0s): splits a cycle
+		// above 5,000 datapoints.
 		component.MustNewType("batch"):    batchprocessor.NewFactory(),
 		component.MustNewType("resource"): resourceprocessor.NewFactory(),
 	}
