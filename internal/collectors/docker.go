@@ -64,6 +64,9 @@ type DockerCollector struct {
 	prevNet  map[string]netSample
 	logger   *slog.Logger // may be nil (tests); Debug/Warn logs are then no-ops
 
+	memo  map[string]inspectMemo // what the last inspect said, per container ID; rebuilt every cycle
+	clock func() instant         // systemInstant; overridable in tests
+
 	warnedTruncated bool // WARN once per process lifetime, not once per cycle
 }
 
@@ -76,6 +79,8 @@ func NewDockerCollector(endpoint string, excludedImages []string, logger *slog.L
 		prevCPU:  map[string]cpuSample{},
 		prevNet:  map[string]netSample{},
 		logger:   logger,
+		memo:     map[string]inspectMemo{},
+		clock:    systemInstant,
 	}
 }
 
@@ -145,6 +150,10 @@ func (d *DockerCollector) Collect(ctx context.Context) DockerResult {
 		d.api = api
 	}
 
+	// The cycle's start is read before the list call: anything the list does not show
+	// yet happened after it (spec 4.1, "checked").
+	start := d.clock()
+
 	// ContainerList doubles as the presence probe. All=true so recently exited
 	// containers stay visible in the snapshot.
 	list, err := d.api.ContainerList(ctx, client.ContainerListOptions{All: true})
@@ -181,22 +190,41 @@ func (d *DockerCollector) Collect(ctx context.Context) DockerResult {
 		}
 	}
 
-	now := time.Now()
+	cy := &dockerCycle{
+		start:    start,
+		now:      d.clock(),
+		statsNow: time.Now(),
+		prevCPU:  make(map[string]cpuSample, len(items)),
+		prevNet:  make(map[string]netSample, len(items)),
+		memo:     make(map[string]inspectMemo, len(items)),
+	}
 	out := make([]ContainerStats, 0, len(items)) // non-nil: zero containers must marshal as []
-	newPrevCPU := make(map[string]cpuSample, len(items))
-	newPrevNet := make(map[string]netSample, len(items))
 	for i := range items {
 		c := &items[i]
-		cs, ok := d.snapshotFor(ctx, c, now, newPrevCPU, newPrevNet)
+		cs, ok := d.snapshotFor(ctx, c, cy)
 		if !ok {
 			continue
 		}
 		truncateFields(&cs)
 		out = append(out, cs)
 	}
-	d.prevCPU = newPrevCPU
-	d.prevNet = newPrevNet
+	d.prevCPU = cy.prevCPU
+	d.prevNet = cy.prevNet
+	d.memo = cy.memo
+	d.debug("docker: cycle", "containers", len(items), "inspected", cy.inspected)
 	return DockerResult{Status: DockerPresent, Containers: out}
+}
+
+// dockerCycle is one Collect call's clocks and the state it builds for the next cycle.
+type dockerCycle struct {
+	start    instant   // read before the list call
+	now      instant   // read after it; its Wall bounds exited-container retention
+	statsNow time.Time // the stats path's own reading, for CPU and network deltas
+
+	prevCPU   map[string]cpuSample
+	prevNet   map[string]netSample
+	memo      map[string]inspectMemo
+	inspected int // inspect calls made
 }
 
 // truncateFields bounds the daemon-sourced string fields that carry no length or
@@ -239,8 +267,9 @@ func truncateRunes(s string, limit int) string {
 // snapshotFor builds one container's snapshot; ok=false when the container is out of
 // scope (created/removing, or exited past retention / with unreadable inspect). Running
 // containers survive stats/inspect errors — they just lose the affected fields.
-func (d *DockerCollector) snapshotFor(ctx context.Context, c *ctypes.Summary, now time.Time,
-	newPrevCPU map[string]cpuSample, newPrevNet map[string]netSample) (ContainerStats, bool) {
+// The four inspect fields come from memory when the list row proves them current
+// (canReuse), else from an inspect call.
+func (d *DockerCollector) snapshotFor(ctx context.Context, c *ctypes.Summary, cy *dockerCycle) (ContainerStats, bool) {
 
 	state := string(c.State)
 	switch state {
@@ -261,32 +290,47 @@ func (d *DockerCollector) snapshotFor(ctx context.Context, c *ctypes.Summary, no
 	}
 
 	gone := state == "exited" || state == "dead"
-	insp, err := d.api.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
-	switch {
-	case err != nil && gone:
-		// Exited containers need FinishedAt to bound retention; without it, skip.
-		d.debug("docker: inspect failed for exited/dead container", "id", c.ID, "err", err)
-		return ContainerStats{}, false
-	case err != nil:
-		d.debug("docker: inspect failed", "id", c.ID, "err", err)
-	case err == nil:
-		cs.RestartCount = insp.Container.RestartCount
-		st := insp.Container.State
-		if st == nil {
+	var prev *inspectMemo
+	if m, ok := d.memo[c.ID]; ok {
+		prev = &m
+	}
+	if canReuse(state, c.Status, prev, cy.now) {
+		m := *prev
+		m.Checked = cy.start
+		cy.memo[c.ID] = m // remembered also when retention leaves it out below
+		if !applyInspectMemo(&cs, m, gone, cy.now.Wall) {
+			return ContainerStats{}, false
+		}
+	} else {
+		cy.inspected++
+		insp, err := d.api.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+		switch {
+		case err != nil && gone:
+			// Exited containers need FinishedAt to bound retention; without it, skip.
+			d.debug("docker: inspect failed for exited/dead container", "id", c.ID, "err", err)
+			return ContainerStats{}, false
+		case err != nil:
+			d.debug("docker: inspect failed", "id", c.ID, "err", err)
+		case insp.Container.State == nil:
+			cs.RestartCount = insp.Container.RestartCount
 			if gone {
 				return ContainerStats{}, false
 			}
-			break
-		}
-		cs.StartedAtUnixMs = dockerTimeMs(st.StartedAt)
-		if gone {
-			finished := dockerTimeMs(st.FinishedAt)
-			if finished == 0 || now.Sub(time.UnixMilli(finished)) > exitedRetention {
+		default:
+			st := insp.Container.State
+			m := inspectMemo{
+				RestartCount: insp.Container.RestartCount,
+				StartedAt:    dockerTime(st.StartedAt),
+				FinishedAt:   dockerTime(st.FinishedAt),
+				ExitCode:     st.ExitCode,
+				State:        state,
+				Checked:      cy.start,
+				Inspected:    cy.start,
+			}
+			cy.memo[c.ID] = m // remembered also when retention leaves it out below
+			if !applyInspectMemo(&cs, m, gone, cy.now.Wall) {
 				return ContainerStats{}, false
 			}
-			cs.FinishedAtUnixMs = finished
-			code := st.ExitCode
-			cs.ExitCode = &code
 		}
 	}
 
@@ -298,15 +342,33 @@ func (d *DockerCollector) snapshotFor(ctx context.Context, c *ctypes.Summary, no
 				if err := json.NewDecoder(res.Body).Decode(&raw); err != nil {
 					return
 				}
-				curCPU, curNet := applyRunningStats(&cs, &raw, d.prevCPU[c.ID], d.prevNet[c.ID], now)
-				newPrevCPU[c.ID] = curCPU
-				newPrevNet[c.ID] = curNet
+				curCPU, curNet := applyRunningStats(&cs, &raw, d.prevCPU[c.ID], d.prevNet[c.ID], cy.statsNow)
+				cy.prevCPU[c.ID] = curCPU
+				cy.prevNet[c.ID] = curNet
 			}()
 		} else {
 			d.debug("docker: stats failed", "id", c.ID, "err", err)
 		}
 	}
 	return cs, true
+}
+
+// applyInspectMemo fills the four inspect fields from m: the one path for both a reuse
+// and a fresh inspect, so the two cannot drift apart. ok=false when an exited or dead
+// container is out of scope (no finish time, or past exitedRetention at now).
+func applyInspectMemo(cs *ContainerStats, m inspectMemo, gone bool, now time.Time) bool {
+	cs.RestartCount = m.RestartCount
+	cs.StartedAtUnixMs = unixMsOrZero(m.StartedAt)
+	if gone {
+		finished := unixMsOrZero(m.FinishedAt)
+		if finished == 0 || now.Sub(time.UnixMilli(finished)) > exitedRetention {
+			return false
+		}
+		cs.FinishedAtUnixMs = finished
+		code := m.ExitCode
+		cs.ExitCode = &code
+	}
+	return true
 }
 
 func (d *DockerCollector) excluded(image string) bool {

@@ -88,11 +88,21 @@ func calculateNetRate(cur, prev uint64, elapsed float64) float64 {
 	return float64(cur-prev) / elapsed
 }
 
-// dockerTimeMs parses Docker's RFC3339Nano timestamps; the zero sentinel
-// ("0001-01-01T00:00:00Z") and unparseable values map to 0.
-func dockerTimeMs(s string) int64 {
+// dockerTime parses Docker's RFC3339Nano timestamps; the zero sentinel
+// ("0001-01-01T00:00:00Z") and unparseable values give the zero time.
+func dockerTime(s string) time.Time {
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil || t.Year() <= 1 {
+		return time.Time{}
+	}
+	return t
+}
+
+// dockerTimeMs is dockerTime in Unix milliseconds, 0 for the zero time.
+func dockerTimeMs(s string) int64 { return unixMsOrZero(dockerTime(s)) }
+
+func unixMsOrZero(t time.Time) int64 {
+	if t.IsZero() {
 		return 0
 	}
 	return t.UnixMilli()

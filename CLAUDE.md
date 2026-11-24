@@ -57,7 +57,15 @@ internal/
   snapshot in Postgres (`docker_containers`, current-only). Config:
   `monitorable.docker.{mode: auto|on|off, endpoint, excluded_images, timeout}`. The
   collector user must be in the `docker` group; if the socket is present but inaccessible
-  the receiver logs an actionable WARN.
+  the receiver logs an actionable WARN. Each cycle it lists the containers and reads stats
+  for the running ones; since v1.10.0 it inspects a container only when its list row does
+  not prove the remembered restart count, start time, finish time and exit code current
+  (`canReuse` in `internal/collectors/docker_memo.go`: first sight, a state change, the
+  first three minutes after a start or stop, an exited container with a restart count above
+  zero, once an hour, or a status text it cannot match; any doubt inspects, which is
+  v1.9.0's behaviour). The memory is in-process only, rebuilt every cycle.
+  `TestReuseNeverDiffersFromInspect` runs a model daemon for 5,000 cycles against a
+  collector without memory. Spec: `docs/superpowers/specs/2026-11-24-lean-agent-part3-design.md`.
 - **Listening ports**: the `monitorable` receiver samples `/proc/net/tcp{,6}` every 10s
   (the ports list: LISTEN = state `0A`, per-port connection counts = ESTABLISHED `01`, keyed
   by local port; the sampler also counts every state, see "TCP state counts") and,
