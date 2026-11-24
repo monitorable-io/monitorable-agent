@@ -180,6 +180,11 @@ jobs:
           # and the --preflight `s3 s3 cp` don't match `put<space>…install.sh`, so this stays
           # at exactly one on the current script.
           test "$(grep -cE '^[[:space:]]*put[[:space:]].*install\.sh' scripts/publish-dist.sh)" -eq 1
+      - name: Release binary size budget (stripped, no stock telemetry)
+        run: |
+          grep -q -- '-ldflags "-s -w -X ' scripts/publish-dist.sh
+          test "$(stat -c %s distribution-build/binaries/otel/monitorable-agent-linux-amd64)" -le 33000000
+          test "$(stat -c %s distribution-build/binaries/otel/monitorable-agent-linux-arm64)" -le 31000000
       - name: Distribution backstop checker (scripts/test-check-published-dist.sh)
         run: scripts/test-check-published-dist.sh
       - name: Distribution backstop trigger (scripts/test-dispatch-dist-backstop.sh)
@@ -227,9 +232,10 @@ jobs:
           fi
           echo "SMOKE_OK: persistent queue file present: $MONITORABLE_STATE_DIR/exporter_otlp_http__metrics"
           kill "$PID" 2>/dev/null || true
-      # Vulnerability scan over the full dependency graph (>1000 packages, incl. the
-      # aws-sdk/k8s trees that otelconftelemetry links in). Reachability-based, so it
-      # reports the ones actually callable from this binary.
+      # Vulnerability scan over the full dependency graph. Reachability-based, so it
+      # reports the ones actually callable from this binary. (Since v1.8.0 the graph no
+      # longer has the aws-sdk/k8s trees: the stock otelconftelemetry factory that linked
+      # them is replaced by internal/selftelemetry.)
       # go-version-input, not go-version-file: the action's own setup-go reads only
       # the `go` directive (1.27.0 → latest cached 1.27.x) and ignores the
       # `toolchain` line, so stdlib findings fixed in a newer patch kept failing the scan.
@@ -237,5 +243,5 @@ jobs:
       - name: govulncheck
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
-          go-version-input: 1.27.3
+          go-version-input: 1.27.4
           repo-checkout: false

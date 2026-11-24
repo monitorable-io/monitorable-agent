@@ -12,9 +12,12 @@
 # a usable socket is present. Collection cadence is controlled by the batch processor.
 
 receivers:
-  # Standard OTel host metrics. Scraper / metric selection below is matched to the
-  # exact metric names the backend queries; do not prune without checking
-  # internal/metrics/service.go.
+  # Standard OTel host metrics. The selection below is what the backend's data
+  # catalog stores: a metric or device the backend drops at ingest is not
+  # collected (devices it denies: lo, docker0, veth*, br-*, loop*, /dev/loop*).
+  # The two are coupled in one direction: a metric added to the catalog later
+  # has to be switched on here, in an agent release.
+  # TestShippedHostMetricsEmitOnlyStoredSeries pins the selection.
   host_metrics:
     collection_interval: 60s
     scrapers:
@@ -24,7 +27,15 @@ receivers:
       # between scrapes (ucal ErrTimeStatNotFound), dropping ALL cpu metrics. See
       # docs/cpu-metrics.md.
       load: {}        # system.cpu.load_average.{1m,5m,15m}
-      disk: {}        # system.disk.* (I/O throughput / operations)
+      disk:           # system.disk.{io,operations,io_time}
+        exclude:
+          devices: ['^loop\d+$']
+          match_type: regexp
+        metrics:
+          system.disk.merged: {enabled: false}
+          system.disk.operation_time: {enabled: false}
+          system.disk.weighted_io_time: {enabled: false}
+          system.disk.pending_operations: {enabled: false}
       filesystem:     # system.filesystem.usage{state=...} for the root mount ("/")
         # Keep ZFS roots (nodev/virtual-classified since collector v0.154) but drop
         # the kernel pseudo-filesystems + tmpfs + container overlays — the sandboxed
@@ -36,8 +47,20 @@ receivers:
         exclude_fs_types:
           match_type: strict
           fs_types: [autofs, binfmt_misc, bpf, cgroup, cgroup2, configfs, debugfs, devpts, devtmpfs, fuse.lxcfs, fusectl, hugetlbfs, mqueue, nsfs, overlay, proc, procfs, pstore, ramfs, securityfs, selinuxfs, squashfs, sysfs, tmpfs, tracefs]
-      network: {}     # system.network.{io,packets,errors}{direction=...}
-      paging: {}      # system.paging.usage{state=...} (swap)
+        # A loop-mounted image (e.g. ext4 on /dev/loop3) passes the fs-type rule.
+        exclude_devices:
+          devices: ['^/dev/loop\d+$']
+          match_type: regexp
+        metrics:
+          system.filesystem.inodes.usage: {enabled: false}
+      network:        # system.network.{io,packets,dropped,errors,connections}
+        exclude:
+          interfaces: ['^(lo|docker0|veth.+|br-.+)$']
+          match_type: regexp
+      paging:         # system.paging.usage{state=...} (swap)
+        metrics:
+          system.paging.operations: {enabled: false}
+          system.paging.faults: {enabled: false}
       memory:         # system.memory.usage{state=...}
         metrics:
           system.memory.utilization:

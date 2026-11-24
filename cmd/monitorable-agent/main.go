@@ -20,10 +20,10 @@ import (
 	"go.opentelemetry.io/collector/processor"
 	"go.opentelemetry.io/collector/processor/batchprocessor"
 	"go.opentelemetry.io/collector/receiver"
-	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 
 	"github.com/monitorable-io/monitorable-agent/internal/extension/writebehindstorage"
 	"github.com/monitorable-io/monitorable-agent/internal/receiver/monitorable"
+	"github.com/monitorable-io/monitorable-agent/internal/selftelemetry"
 	"github.com/monitorable-io/monitorable-agent/internal/version"
 )
 
@@ -65,8 +65,11 @@ func newFactories() otelcol.Factories {
 	// Set up connectors (empty)
 	factories.Connectors = map[component.Type]connector.Factory{}
 
-	// Required by otelcol: telemetry factory must be set
-	factories.Telemetry = otelconftelemetry.NewFactory()
+	// Required by otelcol. Our own factory: the console logger of the stock
+	// one, no-op meters and tracers. The stock otelconftelemetry factory links
+	// the AWS, Kubernetes, GCP and OAuth dependency trees (about 15 MB of
+	// binary) for internal metrics and traces the shipped config turns off.
+	factories.Telemetry = selftelemetry.NewFactory()
 
 	return factories
 }
