@@ -399,13 +399,13 @@ On staging 19, updated from v1.8.0:
   metrics appear seconds after install and arrive a minute sooner from then
   on; and on hosts where several processes listen on one port, the
   Connections panel now counts each listener.
-- **Docs wording, founder ruling needed.** Eight places on four pages of
+- **Docs wording, ruled by the founder on 2026-11-24.** Eight places on four pages of
   `monitorable-landing/src/content/docs/docs/` say the first batch arrives
   about a minute after the service starts: `faq.md` (the description and "How
   quickly do metrics appear?"), `getting-started.md` (the description and two
   places in the text), `agent/install.md` (two places) and
-  `troubleshooting/no-data.md` ("Give a fresh install 60 seconds"). Proposed
-  default: "The first batch arrives a few seconds after
+  `troubleshooting/no-data.md` ("Give a fresh install 60 seconds"). The
+  wording: "The first batch arrives a few seconds after
   the agent service starts. CPU and network charts need two samples, so they
   fill about a minute later." The wording goes live with the changelog, not
   before.
