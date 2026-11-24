@@ -232,9 +232,10 @@ jobs:
           fi
           echo "SMOKE_OK: persistent queue file present: $MONITORABLE_STATE_DIR/exporter_otlp_http__metrics"
           kill "$PID" 2>/dev/null || true
-      # Vulnerability scan over the full dependency graph (>1000 packages, incl. the
-      # aws-sdk/k8s trees that otelconftelemetry links in). Reachability-based, so it
-      # reports the ones actually callable from this binary.
+      # Vulnerability scan over the full dependency graph. Reachability-based, so it
+      # reports the ones actually callable from this binary. (Since v1.8.0 the graph no
+      # longer has the aws-sdk/k8s trees: the stock otelconftelemetry factory that linked
+      # them is replaced by internal/selftelemetry.)
       # go-version-input, not go-version-file: the action's own setup-go reads only
       # the `go` directive (1.27.0 → latest cached 1.27.x) and ignores the
       # `toolchain` line, so stdlib findings fixed in a newer patch kept failing the scan.
