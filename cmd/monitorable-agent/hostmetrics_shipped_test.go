@@ -44,6 +44,12 @@ func shippedConfigPath() string {
 // TestShippedHostMetricsEmitOnlyStoredSeries runs the shipped host_metrics
 // receiver once on this host and fails on any metric name the backend does not
 // store or any device the backend drops.
+//
+// It needs a host whose "/" is a real filesystem (a VM or bare metal, as CI's
+// ubuntu-latest is): inside a container "/" is overlay, which the shipped
+// fs-type rule excludes, so system.filesystem.usage never appears and the
+// must-have check fails. That failure is deliberate; a skip would silently turn
+// the guard off if CI ever moved into a container job.
 func TestShippedHostMetricsEmitOnlyStoredSeries(t *testing.T) {
 	t.Setenv("MONITORABLE_ENDPOINT", "http://127.0.0.1:4318")
 	t.Setenv("MONITORABLE_API_KEY", "test-key")
