@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -399,5 +400,95 @@ func TestLoadServices(t *testing.T) {
 	}
 	if m := loadServices(filepath.Join(t.TempDir(), "nope")); m == nil || len(m) != 0 {
 		t.Errorf("missing file = %v, want empty non-nil map", m)
+	}
+}
+
+func TestPortsCollector_StatesAreFromTheNewestSample(t *testing.T) {
+	c, root := newTestPorts(t)
+	writeProcNet(t, root, append([]tcpRow{listenRow("0.0.0.0", 22)}, estRows("10.0.0.1", 22, 2)...), nil)
+	sampleAt(t, c, 0)
+	writeProcNet(t, root, append([]tcpRow{listenRow("0.0.0.0", 22)}, estRows("10.0.0.1", 22, 5)...), nil)
+	sampleAt(t, c, 1)
+
+	res := c.Snapshot(30)
+	if res.Status != PortsOK || res.States == nil {
+		t.Fatalf("status %v, states %v; want OK with states", res.Status, res.States)
+	}
+	got := res.States.Counts.ByLabel()
+	if got["ESTABLISHED"] != 5 || got["LISTEN"] != 1 {
+		t.Errorf("ESTABLISHED %d, LISTEN %d; want 5, 1 (the newest sample)", got["ESTABLISHED"], got["LISTEN"])
+	}
+	if want := t0.Add(10 * time.Second); !res.States.At.Equal(want) {
+		t.Errorf("States.At = %v, want %v (the second sample)", res.States.At, want)
+	}
+}
+
+func TestPortsCollector_NoStatesWithoutASample(t *testing.T) {
+	c, root := newTestPorts(t)
+	res := c.Snapshot(30)
+	if res.Status != PortsNoSamples || res.States != nil {
+		t.Errorf("new collector: status %v, states %v; want PortsNoSamples, nil", res.Status, res.States)
+	}
+	_ = root // net/tcp was never written
+	if err := c.Sample(context.Background(), t0); err == nil {
+		t.Fatal("Sample with no net/tcp succeeded")
+	}
+	res = c.Snapshot(30)
+	if res.Status != PortsUnreadable || res.States != nil {
+		t.Errorf("unreadable: status %v, states %v; want PortsUnreadable, nil", res.Status, res.States)
+	}
+}
+
+func TestPortsCollector_StatesWithoutTCP6(t *testing.T) {
+	c, root := newTestPorts(t)
+	writeProcNet(t, root, append([]tcpRow{listenRow("0.0.0.0", 22), row("10.0.0.1", 40000, 0x06)}, estRows("10.0.0.1", 22, 3)...), nil)
+	sampleAt(t, c, 0)
+	res := c.Snapshot(30)
+	if res.States == nil {
+		t.Fatal("States = nil with only net/tcp present")
+	}
+	got := res.States.Counts.ByLabel()
+	if len(got) != 12 {
+		t.Errorf("ByLabel has %d labels, want 12", len(got))
+	}
+	if got["ESTABLISHED"] != 3 || got["LISTEN"] != 1 || got["TIME_WAIT"] != 1 {
+		t.Errorf("states = %v", got)
+	}
+}
+
+func TestPortsCollector_StatesWithNoListener(t *testing.T) {
+	c, root := newTestPorts(t)
+	writeProcNet(t, root, estRows("10.0.0.1", 41000, 4), nil)
+	sampleAt(t, c, 0)
+	res := c.Snapshot(30)
+	if res.Status != PortsOK || res.States == nil {
+		t.Fatalf("status %v, states %v; want OK with states", res.Status, res.States)
+	}
+	if got := res.States.Counts.ByLabel()["ESTABLISHED"]; got != 4 {
+		t.Errorf("ESTABLISHED = %d, want 4 (a host with no listener still has connections)", got)
+	}
+}
+
+func TestPortsSnapshot_JSONKeysUnchanged(t *testing.T) {
+	c, root := newTestPorts(t)
+	writeProcNet(t, root, []tcpRow{listenRow("0.0.0.0", 22)}, nil)
+	sampleAt(t, c, 0)
+	res := c.Snapshot(30)
+	b, err := json.Marshal(res.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(b, &top); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"all_ports", "all_ports_truncated", "collected_at_unix_ms", "ports"}
+	var got []string
+	for k := range top {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("JSON keys = %v, want %v", got, want)
 	}
 }

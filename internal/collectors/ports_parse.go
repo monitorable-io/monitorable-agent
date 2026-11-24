@@ -11,12 +11,44 @@ import (
 	"strings"
 )
 
-// TCP socket states as printed in the st column of /proc/net/tcp{,6}. Only these
-// two are ever counted; TIME_WAIT/CLOSE_WAIT/etc. are deliberately ignored.
+// TCP socket states as printed in the st column of /proc/net/tcp{,6}. The ports
+// list uses these two (LISTEN rows make the list, ESTABLISHED rows the per-port
+// connection counts); every state from 0x01 to 0x0B is also counted per state in
+// TCPStateCounts.
 const (
 	tcpStateEstablished uint8 = 0x01
 	tcpStateListen      uint8 = 0x0A
+	tcpStateMax         uint8 = 0x0B // CLOSING, the highest state the kernel prints
 )
+
+// TCPStateCounts is the number of socket-table rows per kernel state code
+// (index = code, 0x01..0x0B; index 0 unused).
+type TCPStateCounts [12]int
+
+// TCPStateLabels are the twelve state labels of hostmetrics v0.162.0, in its order.
+var TCPStateLabels = [12]string{"CLOSE_WAIT", "CLOSE", "CLOSING", "DELETE", "ESTABLISHED",
+	"FIN_WAIT_1", "FIN_WAIT_2", "LAST_ACK", "LISTEN", "SYN_SENT", "SYN_RECV", "TIME_WAIT"}
+
+// tcpStateCodes maps a label of TCPStateLabels to its kernel code. DELETE has
+// none: the kernel never prints it, and hostmetrics always reports it as 0.
+var tcpStateCodes = map[string]uint8{
+	"ESTABLISHED": 0x01, "SYN_SENT": 0x02, "SYN_RECV": 0x03, "FIN_WAIT_1": 0x04,
+	"FIN_WAIT_2": 0x05, "TIME_WAIT": 0x06, "CLOSE": 0x07, "CLOSE_WAIT": 0x08,
+	"LAST_ACK": 0x09, "LISTEN": 0x0A, "CLOSING": 0x0B,
+}
+
+// ByLabel returns one entry per label in TCPStateLabels, zero included. DELETE is always 0.
+func (c TCPStateCounts) ByLabel() map[string]int64 {
+	out := make(map[string]int64, len(TCPStateLabels))
+	for _, label := range TCPStateLabels {
+		if code, ok := tcpStateCodes[label]; ok {
+			out[label] = int64(c[code])
+		} else {
+			out[label] = 0
+		}
+	}
+	return out
+}
 
 // tcpRow is one socket-table line reduced to what the Ports panel needs. Remote
 // addresses, inodes and UIDs are never kept: they identify peers and processes.
@@ -113,12 +145,18 @@ func isLoopback(a netip.Addr) bool {
 // port's ESTABLISHED rows (any local address, either file); the caller
 // intersects it with listeners. A [::] wildcard socket also accepts IPv4
 // clients, which appear in tcp6 as ::ffff:a.b.c.d, so counting by port alone
-// is what makes those peers visible.
-func summarizeSockets(v4, v6 []tcpRow) (listeners map[uint16]*listenerFacts, established map[uint16]int) {
+// is what makes those peers visible. states counts every row of both tables
+// under the state the kernel printed for it (one per socket, so listeners
+// sharing a port through SO_REUSEPORT count each, as ss -ltn shows them); a
+// code outside 0x01..0x0B is ignored.
+func summarizeSockets(v4, v6 []tcpRow) (listeners map[uint16]*listenerFacts, established map[uint16]int, states TCPStateCounts) {
 	listeners = make(map[uint16]*listenerFacts)
 	established = make(map[uint16]int)
 	add := func(rows []tcpRow, isV6 bool) {
 		for _, r := range rows {
+			if r.State >= 0x01 && r.State <= tcpStateMax {
+				states[r.State]++
+			}
 			switch r.State {
 			case tcpStateListen:
 				f := listeners[r.LocalPort]
@@ -139,5 +177,5 @@ func summarizeSockets(v4, v6 []tcpRow) (listeners map[uint16]*listenerFacts, est
 	}
 	add(v4, false)
 	add(v6, true)
-	return listeners, established
+	return listeners, established, states
 }

@@ -48,11 +48,18 @@ const (
 	PortsUnreadable                    // window empty because the last Sample could not read /proc/net/tcp
 )
 
+// TCPStates is the per-state count of one sample.
+type TCPStates struct {
+	At     time.Time
+	Counts TCPStateCounts
+}
+
 // PortsResult is the outcome of PortsCollector.Snapshot.
 type PortsResult struct {
 	Status   PortsStatus
 	Err      error // last Sample error when Status is PortsUnreadable
 	Snapshot *PortsSnapshot
+	States   *TCPStates // newest sample of the window; nil unless Status == PortsOK
 }
 
 // portSample is one port's state in a single sample.
@@ -62,12 +69,14 @@ type portSample struct {
 }
 
 type portsWindow struct {
-	samples []map[uint16]portSample
-	lastAt  time.Time
+	samples    []map[uint16]portSample
+	lastAt     time.Time
+	lastStates TCPStateCounts // per-state counts of the newest sample
 }
 
 // PortsCollector samples /proc/net/tcp{,6} and aggregates listening ports and
-// ESTABLISHED connection counts over a window. Sample (every ~10s) and Snapshot
+// ESTABLISHED connection counts over a window; it also keeps the per-state
+// socket counts of the newest sample. Sample (every ~10s) and Snapshot
 // (once per collection cycle) run on different goroutines.
 type PortsCollector struct {
 	procRoot string
@@ -97,7 +106,7 @@ func (c *PortsCollector) Sample(ctx context.Context, now time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	listeners, established, err := c.readTables()
+	listeners, established, states, err := c.readTables()
 	if err == nil {
 		err = ctx.Err() // a sample that overran its deadline is skipped
 	}
@@ -114,20 +123,21 @@ func (c *PortsCollector) Sample(ctx context.Context, now time.Time) error {
 	}
 	c.window.samples = append(c.window.samples, s)
 	c.window.lastAt = now
+	c.window.lastStates = states
 	return nil
 }
 
-func (c *PortsCollector) readTables() (map[uint16]*listenerFacts, map[uint16]int, error) {
+func (c *PortsCollector) readTables() (map[uint16]*listenerFacts, map[uint16]int, TCPStateCounts, error) {
 	v4, err := c.readTable("tcp", false)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, TCPStateCounts{}, err
 	}
 	v6, err := c.readTable("tcp6", true)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, nil, err
+		return nil, nil, TCPStateCounts{}, err
 	}
-	listeners, established := summarizeSockets(v4, v6)
-	return listeners, established, nil
+	listeners, established, states := summarizeSockets(v4, v6)
+	return listeners, established, states, nil
 }
 
 func (c *PortsCollector) readTable(name string, v6 bool) ([]tcpRow, error) {
@@ -179,7 +189,7 @@ func (c *PortsCollector) Snapshot(maxPorts int) PortsResult {
 	for _, p := range ports[:min(maxPorts, len(ports))] {
 		snap.Ports = append(snap.Ports, c.detail(uint16(p), last[uint16(p)].facts, w.samples))
 	}
-	return PortsResult{Status: PortsOK, Snapshot: snap}
+	return PortsResult{Status: PortsOK, Snapshot: snap, States: &TCPStates{At: w.lastAt, Counts: w.lastStates}}
 }
 
 func (c *PortsCollector) detail(port uint16, facts listenerFacts, samples []map[uint16]portSample) PortDetail {
