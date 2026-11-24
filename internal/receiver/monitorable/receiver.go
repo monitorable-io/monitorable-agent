@@ -63,12 +63,16 @@ type metricsReceiver struct {
 	smartPrev       collectors.SmartStatus
 	smartJSONWarned bool // WARN once per process lifetime when smart.disks exceeds maxSnapshotBytes
 
-	// Listening TCP ports snapshot (nil when ports.mode=off). Sampled by its own
-	// goroutine (runPortsSampler); snapshotted once per collection cycle.
+	// Listening TCP ports snapshot and per-state TCP counts (nil when ports.mode
+	// and tcp_states.mode are both off). Sampled by its own goroutine
+	// (runPortsSampler) when ports.mode is on; otherwise each collection cycle
+	// takes one sample. Snapshotted once per collection cycle.
 	portsCollector  *collectors.PortsCollector
 	portsMode       string
 	portsPrev       collectors.PortsStatus
 	portsJSONWarned bool // WARN once per process lifetime when listening.ports exceeds maxSnapshotBytes
+	tcpStatesMode   string
+	tcpStatesPrev   collectors.PortsStatus
 
 	// Cached system metadata (updated periodically, used in all OTLP payloads)
 	cachedSystemInfo   *collectors.SystemInfo
@@ -147,13 +151,19 @@ func newMetricsReceiver(
 		r.smartCollector = collectors.NewSmartCollector()
 	}
 
-	// Listening TCP ports: self-sampling collector over /proc/net/tcp{,6} (nil when mode=off).
+	// Listening TCP ports and TCP state counts: one collector over
+	// /proc/net/tcp{,6}, nil only when both modes are off.
 	r.portsMode = cfg.Ports.Mode
 	if r.portsMode == "" {
 		r.portsMode = PortsModeAuto
 	}
 	r.portsPrev = collectors.PortsStatus(-1) // unset → first status always logs
-	if r.portsMode != PortsModeOff {
+	r.tcpStatesMode = cfg.TCPStates.Mode
+	if r.tcpStatesMode == "" {
+		r.tcpStatesMode = TCPStatesModeOff
+	}
+	r.tcpStatesPrev = collectors.PortsStatus(-1)
+	if r.portsMode != PortsModeOff || r.tcpStatesMode != TCPStatesModeOff {
 		r.portsCollector = collectors.NewPortsCollector("/proc", "/etc/services", slogLogger)
 	}
 
@@ -188,7 +198,7 @@ func (r *metricsReceiver) Start(ctx context.Context, host component.Host) error 
 	r.wg.Add(1)
 	go r.redetectCapabilities(ctx)
 
-	if r.portsCollector != nil {
+	if r.runsPortsSampler() {
 		r.wg.Add(1)
 		go r.runPortsSampler(ctx, r.cfg.Ports.SampleInterval)
 	}
@@ -294,7 +304,7 @@ func (r *metricsReceiver) performUnifiedCollection(ctx context.Context) {
 
 	scopeMetrics := resourceMetrics.ScopeMetrics().AppendEmpty()
 
-	// Listening ports: the attribute and gauges ride this same batch.
+	// Listening ports and TCP state counts: the attribute and metrics ride this same batch.
 	r.collectListeningPorts(ctx, resourceAttrs, scopeMetrics.Metrics())
 
 	// Collect all metrics

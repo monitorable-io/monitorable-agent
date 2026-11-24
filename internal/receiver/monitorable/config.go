@@ -69,6 +69,22 @@ const (
 	maxPortsMaxPorts           = 100
 )
 
+// TCP state count modes. The default in the binary is off, so a v1.9.0 binary
+// running a v1.8.0 config (hostmetrics still sends system.network.connections)
+// behaves as v1.8.0; the shipped config sets auto.
+const (
+	TCPStatesModeAuto = "auto" // send; quiet when /proc/net/tcp is unreadable
+	TCPStatesModeOn   = "on"   // send; WARN when /proc/net/tcp is unreadable
+	TCPStatesModeOff  = "off"  // never send
+)
+
+// TCPStatesConfig controls system.network.connections, the per-state TCP socket
+// counts taken from the ports sampler's reads of /proc/net/tcp{,6}. ports.mode
+// off does not stop them: each collection cycle then reads the tables itself.
+type TCPStatesConfig struct {
+	Mode string `mapstructure:"mode"` // auto | on | off
+}
+
 // PortsConfig controls the listening-TCP-ports snapshot (sampled from
 // /proc/net/tcp{,6}; no privilege needed).
 type PortsConfig struct {
@@ -102,7 +118,6 @@ type DockerConfig struct {
 // Config defines configuration for the monitorable receiver
 type Config struct {
 	// Collection interval - unified for all metrics and metadata
-	// This should normally be controlled by the batch processor configuration
 	CollectionInterval time.Duration `mapstructure:"collection_interval"`
 	CapabilityInterval time.Duration `mapstructure:"capability_interval"`
 
@@ -122,6 +137,9 @@ type Config struct {
 
 	// Listening TCP ports + ESTABLISHED connection counts (self-sampling; no privilege)
 	Ports PortsConfig `mapstructure:"ports"`
+
+	// Per-state TCP socket counts (system.network.connections) from the ports sampler
+	TCPStates TCPStatesConfig `mapstructure:"tcp_states"`
 
 	// Address probe (announces the server over IPv4 and IPv6; off without an endpoint)
 	AddressProbe AddressProbeConfig `mapstructure:"address_probe"`
@@ -203,6 +221,14 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.Ports.MaxPorts < 1 || cfg.Ports.MaxPorts > maxPortsMaxPorts {
 		return fmt.Errorf("monitorable: ports.max_ports %d is outside 1-%d", cfg.Ports.MaxPorts, maxPortsMaxPorts)
+	}
+	switch cfg.TCPStates.Mode {
+	case "":
+		cfg.TCPStates.Mode = TCPStatesModeOff
+	case TCPStatesModeAuto, TCPStatesModeOn, TCPStatesModeOff:
+		// ok
+	default:
+		return fmt.Errorf("monitorable: invalid tcp_states.mode %q (want auto|on|off)", cfg.TCPStates.Mode)
 	}
 	if cfg.AddressProbe.Interval == 0 {
 		cfg.AddressProbe.Interval = defaultAddressProbeInterval
