@@ -104,7 +104,8 @@ func TestHoldsBelowCount(t *testing.T) {
 
 func TestSendsAfterMaxWait(t *testing.T) {
 	sink := new(consumertest.MetricsSink)
-	p := newTestProcessor(t, 2, 50*time.Millisecond, sink)
+	// 200 ms: the "empty right after the call" check must not race the timer.
+	p := newTestProcessor(t, 2, 200*time.Millisecond, sink)
 	consume(t, p, "a")
 	if n := len(sink.AllMetrics()); n != 0 {
 		t.Fatalf("sink holds %d Metrics right after the call, want 0", n)
@@ -136,10 +137,12 @@ func TestLateDeliveryStartsItsOwnGroup(t *testing.T) {
 
 func TestSilentPartnerDoesNotHoldData(t *testing.T) {
 	sink := new(consumertest.MetricsSink)
-	p := newTestProcessor(t, 2, 50*time.Millisecond, sink)
+	// 180 ms of slack between the timer and the next delivery: a timer
+	// goroutine delayed on a loaded -race runner must not merge two calls.
+	p := newTestProcessor(t, 2, 20*time.Millisecond, sink)
 	for i := 0; i < 5; i++ {
 		consume(t, p, "alone")
-		time.Sleep(120 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 	waitFor(t, sink, 5, time.Second)
 	got := resourceCounts(sink)
@@ -288,3 +291,60 @@ func TestCapabilitiesMutatesData(t *testing.T) {
 }
 
 var _ component.Config = (*Config)(nil)
+
+// blockingSink holds every ConsumeMetrics until release is closed, and signals
+// entered on its first call.
+type blockingSink struct {
+	consumertest.MetricsSink
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingSink) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return b.MetricsSink.ConsumeMetrics(ctx, md)
+}
+
+// A timer send still in progress when Shutdown is called must finish before
+// Shutdown returns: the collector shuts the next processor down right after,
+// and a group handed over then would be lost.
+func TestShutdownWaitsForATimerSendInProgress(t *testing.T) {
+	sink := &blockingSink{entered: make(chan struct{}), release: make(chan struct{})}
+	p, err := NewFactory().CreateMetrics(context.Background(),
+		processortest.NewNopSettings(NewFactory().Type()), &Config{Deliveries: 2, MaxWait: 20 * time.Millisecond}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	consume(t, p, "alone")
+	select {
+	case <-sink.entered: // the timer fired and the send is blocked downstream
+	case <-time.After(time.Second):
+		t.Fatal("the timer send never reached downstream")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = p.Shutdown(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+		close(sink.release)
+		t.Fatal("Shutdown returned while a send was still in progress")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(sink.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not return after the send finished")
+	}
+	if n := len(sink.AllMetrics()); n != 1 {
+		t.Fatalf("sink holds %d Metrics, want 1", n)
+	}
+}

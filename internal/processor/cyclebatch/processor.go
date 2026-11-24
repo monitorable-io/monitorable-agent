@@ -28,6 +28,10 @@ type cycleBatch struct {
 	gen      uint64 // identifies the current group; a stale timer sees another value
 	timer    *time.Timer
 	shutdown bool
+	// inflight counts groups handed over and not yet returned from next;
+	// Shutdown waits for it. Add happens under mu, before Shutdown can see
+	// the group gone.
+	inflight sync.WaitGroup
 }
 
 func newCycleBatch(logger *zap.Logger, deliveries int, maxWait time.Duration, next consumer.Metrics) *cycleBatch {
@@ -85,6 +89,10 @@ func (p *cycleBatch) Shutdown(context.Context) error {
 	p.shutdown = true
 	if p.count == 0 {
 		p.mu.Unlock()
+		// A timer may have handed its group over just before: wait until
+		// that send has returned, or the next processor could be shut down
+		// before the group reaches it.
+		p.inflight.Wait()
 		return nil
 	}
 	p.handOverLocked()
@@ -101,6 +109,8 @@ func (p *cycleBatch) handOverLocked() {
 	out := p.pending
 	p.pending = pmetric.Metrics{}
 	p.count = 0
+	p.inflight.Add(1)
+	defer p.inflight.Done()
 	p.sendMu.Lock()
 	p.mu.Unlock()
 	defer p.sendMu.Unlock()
